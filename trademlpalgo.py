@@ -396,18 +396,25 @@ class Trader:
         if best_bid is None and best_ask is None:
             return orders, trader_state
 
-        # -- MLP fair value ----------------------------------------
-        x, mid = extract_features(od, market_trades, trader_state, "INTARIAN_PEPPER_ROOT")
-        if mid == 0:
-            return orders, trader_state
-        fair = predict_price("INTARIAN_PEPPER_ROOT", x, mid)
-        delta = predict_delta("INTARIAN_PEPPER_ROOT", x)
-
-        # Adjust aggressiveness based on MLP confidence
-        if delta > 0.5:
-            buy_edge = PEPPER_BUY_EDGE + 2
-        else:
-            buy_edge = PEPPER_BUY_EDGE - 1
+       # -- MLP fair value ----------------------------------------
+        try:
+            x, mid = extract_features(od, market_trades, trader_state, "INTARIAN_PEPPER_ROOT")
+            if mid == 0:
+                return orders, trader_state
+            fair = predict_price("INTARIAN_PEPPER_ROOT", x, mid)
+            delta = predict_delta("INTARIAN_PEPPER_ROOT", x)
+            if delta > 0.5:
+                buy_edge = PEPPER_BUY_EDGE + 2
+            else:
+                buy_edge = PEPPER_BUY_EDGE - 1
+        except:
+            # Fallback to simple mid
+            if best_bid is not None and best_ask is not None:
+                mid = (best_bid + best_ask) / 2
+            else:
+                mid = float(best_bid or best_ask)
+            fair = mid
+            buy_edge = PEPPER_BUY_EDGE
     
         logger.print(f"PEPPER t={timestamp} fair={fair:.1f} mid={mid:.1f} pos={position}")
 
