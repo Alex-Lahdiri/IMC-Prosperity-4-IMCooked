@@ -414,7 +414,7 @@ class Trader:
         # -- 1. Aggressive BUY: take any ask <= fair + BUY_EDGE ----
         if od.sell_orders:
             for ask in sorted(od.sell_orders.keys()):
-                if ask <= fair + PEPPER_BUY_EDGE and position < limit:
+                if ask <= fair + buy_edge and position < limit:
                     qty = min(-od.sell_orders[ask], limit - position)
                     if qty > 0:
                         orders.append(Order("INTARIAN_PEPPER_ROOT", ask, qty))
