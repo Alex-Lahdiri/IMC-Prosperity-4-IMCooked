@@ -308,13 +308,17 @@ class Trader:
             od: OrderDepth = state.order_depths[product]
             position = state.position.get(product, 0)
             limit = POSITION_LIMITS.get(product, 80)
-            if product == "ASH_COATED_OSMIUM":
-                result[product] = self.trade_osmium(od, position, limit)
-            elif product == "INTARIAN_PEPPER_ROOT":
-                result[product], trader_state = self.trade_pepper(
-                    od, position, limit, state.timestamp, trader_state,
-                    state.market_trades
-                )
+            try:
+                if product == "ASH_COATED_OSMIUM":
+                    result[product] = self.trade_osmium(od, position, limit)
+                elif product == "INTARIAN_PEPPER_ROOT":
+                    result[product], trader_state = self.trade_pepper(
+                        od, position, limit, state.timestamp, trader_state,
+                        state.market_trades
+                    )
+            except Exception as e:
+                result[product] = []
+                logger.print(f"ERROR {product}: {e}")
         trader_data = json.dumps(trader_state)
         conversions = 0
         logger.flush(state, result, conversions, trader_data)
