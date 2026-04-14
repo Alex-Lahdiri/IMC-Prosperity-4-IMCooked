@@ -3,7 +3,7 @@ from typing import Any, List, Dict
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 
 # ─────────────────────────────────────────────────────────────────────
-#  Logger (standard Prosperity 4 logger for the visualizer)
+#  Logger (Standard Prosperity 4 logger for the visualizer)
 # ─────────────────────────────────────────────────────────────────────
 
 class Logger:
