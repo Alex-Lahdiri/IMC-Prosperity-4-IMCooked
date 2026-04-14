@@ -111,7 +111,7 @@ class Logger:
 logger = Logger()
 
 # ─────────────────────────────────────────────────────────────────────
-#  CONFIGURATION
+#  CONFIGURATION — proven v1 parameters, do NOT change
 # ─────────────────────────────────────────────────────────────────────
 
 POSITION_LIMITS = {
@@ -119,72 +119,13 @@ POSITION_LIMITS = {
     "INTARIAN_PEPPER_ROOT": 80,
 }
 
-# Osmium: fixed fair value
 OSMIUM_FAIR = 10_000
-OSMIUM_AGGRESSIVE_EDGE = 1         # Take mispricing beyond 1 from fair
+OSMIUM_SPREAD_HALF = 5
+OSMIUM_AGGRESSIVE_EDGE = 1
 
-# Osmium multi-level quoting config (improvement #1)
-# [offset_from_fair, fraction_of_remaining_capacity]
-OSMIUM_QUOTE_LEVELS = [
-    (4, 0.50),   # Level 1: fair ± 4, 50% of remaining capacity
-    (5, 0.30),   # Level 2: fair ± 5, 30% of remaining capacity
-    (7, 1.00),   # Level 3: fair ± 7, all remaining capacity
-]
-
-# Pepper Root: linear trend parameters
-PEPPER_SLOPE = 1.0 / 1000          # +1 per 1000 timestamp units
+PEPPER_SLOPE = 1.0 / 1000
+PEPPER_SPREAD_HALF = 4
 PEPPER_AGGRESSIVE_EDGE = 2
-PEPPER_DEFAULT_SPREAD_HALF = 4     # Fallback when book is empty
-
-# Pepper Root: known starting intercepts from historical data
-# Day -2 started ~10000, day -1 ~11000, day 0 ~12000 => day 1 ~13000
-PEPPER_EXPECTED_INTERCEPT = 13_000  # Improvement #2: trade from tick 1
-
-
-# ─────────────────────────────────────────────────────────────────────
-#  HELPER FUNCTIONS
-# ─────────────────────────────────────────────────────────────────────
-
-def get_weighted_mid(od: OrderDepth) -> float | None:
-    """Improvement #5: Volume-weighted mid-price instead of simple mid."""
-    if not od.buy_orders or not od.sell_orders:
-        # Fall back to simple mid if one side is empty
-        if od.buy_orders and not od.sell_orders:
-            return float(max(od.buy_orders.keys()))
-        elif od.sell_orders and not od.buy_orders:
-            return float(min(od.sell_orders.keys()))
-        return None
-
-    best_bid = max(od.buy_orders.keys())
-    best_ask = min(od.sell_orders.keys())
-    bid_vol = abs(od.buy_orders[best_bid])
-    ask_vol = abs(od.sell_orders[best_ask])
-
-    if bid_vol + ask_vol == 0:
-        return (best_bid + best_ask) / 2
-
-    # Volume-weighted: price leans toward the side with MORE volume
-    # (more volume on bid = price closer to ask, market is bid-heavy)
-    wmid = (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
-    return wmid
-
-
-def get_dynamic_spread(od: OrderDepth, default_half: int) -> int:
-    """Improvement #4: Adapt spread to actual market spread."""
-    if not od.buy_orders or not od.sell_orders:
-        return default_half
-
-    best_bid = max(od.buy_orders.keys())
-    best_ask = min(od.sell_orders.keys())
-    market_spread = best_ask - best_bid
-
-    if market_spread <= 0:
-        return default_half
-
-    # Quote at roughly 50-60% of market spread per side
-    # but never tighter than 3 or wider than 8
-    half = max(3, min(8, int(market_spread * 0.55)))
-    return half
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -196,7 +137,6 @@ class Trader:
     def run(self, state: TradingState):
         result: Dict[Symbol, List[Order]] = {}
 
-        # ── Restore persisted state ──────────────────────────────
         trader_state = {}
         if state.traderData:
             try:
@@ -204,250 +144,202 @@ class Trader:
             except Exception:
                 trader_state = {}
 
-        # ── Process each product ─────────────────────────────────
         for product in state.order_depths:
             order_depth: OrderDepth = state.order_depths[product]
-            orders: List[Order] = []
             position = state.position.get(product, 0)
-            limit = POSITION_LIMITS.get(product, 50)
+            limit = POSITION_LIMITS.get(product, 80)
 
             if product == "ASH_COATED_OSMIUM":
-                orders = self.trade_osmium(order_depth, position, limit)
-
+                result[product] = self.trade_osmium(order_depth, position, limit)
             elif product == "INTARIAN_PEPPER_ROOT":
                 orders, trader_state = self.trade_pepper(
                     order_depth, position, limit, state.timestamp, trader_state
                 )
+                result[product] = orders
 
-            result[product] = orders
-
-        # ── Persist state across ticks ───────────────────────────
         trader_data = json.dumps(trader_state)
         conversions = 0
         logger.flush(state, result, conversions, trader_data)
         return result, conversions, trader_data
 
     # ═════════════════════════════════════════════════════════════
-    #  ASH_COATED_OSMIUM — Market-Making with Multi-Level Quotes
+    #  ASH_COATED_OSMIUM — Market-Making around 10,000
+    #
+    #  Changes from v1:
+    #  - Aggressive takes run FIRST so passive quotes use leftover capacity
+    #  - Position-aware edge: need +1 tick edge when >70% loaded
+    #  - Everything else identical to 51k baseline
     # ═════════════════════════════════════════════════════════════
 
-    def trade_osmium(
-        self,
-        od: OrderDepth,
-        position: int,
-        limit: int,
-    ) -> List[Order]:
+    def trade_osmium(self, od: OrderDepth, position: int, limit: int) -> List[Order]:
         orders: List[Order] = []
         fair = OSMIUM_FAIR
 
-        # ── Improvement #3: Aggressive takes FIRST, then passive ──
-        # This ensures aggressive fills aren't blocked by passive quote capacity
+        # ── Position-aware aggressive edge ───────────────────────
+        # When heavily loaded, require more edge to avoid overextending
+        edge = OSMIUM_AGGRESSIVE_EDGE
+        if abs(position) > int(limit * 0.7):
+            edge += 1
 
-        # Improvement #6: Position-aware aggressive edge
-        # When heavily positioned, require more edge to take further
-        pos_ratio = abs(position) / limit  # 0.0 to 1.0
-        adjusted_edge = OSMIUM_AGGRESSIVE_EDGE
-        if pos_ratio > 0.7:
-            adjusted_edge = OSMIUM_AGGRESSIVE_EDGE + 1  # Need 1 more tick of edge when loaded
-
-        # Lift cheap asks (buy below fair - edge)
+        # ── STEP 1: Aggressive takes (run first) ────────────────
         if od.sell_orders:
             for ask_price in sorted(od.sell_orders.keys()):
-                # Only buy if price is cheap enough AND we're not too long
-                if ask_price < fair - adjusted_edge and position < limit:
-                    ask_vol = od.sell_orders[ask_price]   # negative
-                    max_buy = limit - position
-                    buy_qty = min(-ask_vol, max_buy)
+                if ask_price < fair - edge and position < limit:
+                    ask_vol = od.sell_orders[ask_price]       # negative
+                    buy_qty = min(-ask_vol, limit - position)
                     if buy_qty > 0:
                         orders.append(Order("ASH_COATED_OSMIUM", ask_price, buy_qty))
                         position += buy_qty
                         logger.print(f"OSM TAKE BUY {buy_qty}x @ {ask_price}")
-                elif ask_price >= fair - adjusted_edge:
-                    break  # No more cheap levels
+                else:
+                    break
 
-        # Hit expensive bids (sell above fair + edge)
         if od.buy_orders:
             for bid_price in sorted(od.buy_orders.keys(), reverse=True):
-                if bid_price > fair + adjusted_edge and position > -limit:
-                    bid_vol = od.buy_orders[bid_price]    # positive
-                    max_sell = limit + position
-                    sell_qty = min(bid_vol, max_sell)
+                if bid_price > fair + edge and position > -limit:
+                    bid_vol = od.buy_orders[bid_price]        # positive
+                    sell_qty = min(bid_vol, limit + position)
                     if sell_qty > 0:
                         orders.append(Order("ASH_COATED_OSMIUM", bid_price, -sell_qty))
                         position -= sell_qty
                         logger.print(f"OSM TAKE SELL {sell_qty}x @ {bid_price}")
-                elif bid_price <= fair + adjusted_edge:
+                else:
                     break
 
-        # ── Improvement #1: Multi-level passive quoting ──────────
-        # Post 2-3 levels per side at increasing distance from fair
-        # with inventory skew applied to all levels
-
-        # Inventory skew: shift all quotes toward flattening position
+        # ── STEP 2: Passive quotes with REMAINING capacity ──────
         skew = -position * 0.5
         skew = max(-3, min(3, skew))
 
-        # Improvement #4: Dynamic spread from order book
-        base_spread = get_dynamic_spread(od, 5)
+        bid_price = int(round(fair - OSMIUM_SPREAD_HALF + skew))
+        ask_price = int(round(fair + OSMIUM_SPREAD_HALF + skew))
 
-        remaining_bid_capacity = limit - position
-        remaining_ask_capacity = limit + position
+        bid_price = min(bid_price, fair - 1)
+        ask_price = max(ask_price, fair + 1)
 
-        for offset, frac in OSMIUM_QUOTE_LEVELS:
-            # Compute level price with skew
-            bid_price = int(round(fair - offset + skew))
-            ask_price = int(round(fair + offset + skew))
+        # Use remaining capacity after aggressive fills
+        bid_qty = limit - position
+        ask_qty = limit + position
 
-            # Never cross fair value
-            bid_price = min(bid_price, fair - 1)
-            ask_price = max(ask_price, fair + 1)
-
-            # Allocate fraction of remaining capacity
-            bid_qty = max(1, int(remaining_bid_capacity * frac))
-            ask_qty = max(1, int(remaining_ask_capacity * frac))
-
-            # Clamp to actual remaining
-            bid_qty = min(bid_qty, remaining_bid_capacity)
-            ask_qty = min(ask_qty, remaining_ask_capacity)
-
-            if bid_qty > 0:
-                orders.append(Order("ASH_COATED_OSMIUM", bid_price, bid_qty))
-                remaining_bid_capacity -= bid_qty
-
-            if ask_qty > 0:
-                orders.append(Order("ASH_COATED_OSMIUM", ask_price, -ask_qty))
-                remaining_ask_capacity -= ask_qty
-
-            if remaining_bid_capacity <= 0 and remaining_ask_capacity <= 0:
-                break
+        if bid_qty > 0:
+            orders.append(Order("ASH_COATED_OSMIUM", bid_price, bid_qty))
+        if ask_qty > 0:
+            orders.append(Order("ASH_COATED_OSMIUM", ask_price, -ask_qty))
 
         return orders
 
     # ═════════════════════════════════════════════════════════════
-    #  INTARIAN_PEPPER_ROOT — Trend Following + Adaptive MM
+    #  INTARIAN_PEPPER_ROOT — Linear Trend Following + MM
+    #
+    #  Changes from v1:
+    #  - Faster bootstrap: 5 ticks instead of 10 (less lost PnL)
+    #  - Weighted mid-price for more accurate fair value
+    #  - Aggressive takes run FIRST
+    #  - Position-aware edge when >70% loaded
+    #  - Everything else identical to 51k baseline
     # ═════════════════════════════════════════════════════════════
 
-    def trade_pepper(
-        self,
-        od: OrderDepth,
-        position: int,
-        limit: int,
-        timestamp: int,
-        trader_state: dict,
-    ) -> tuple[List[Order], dict]:
+    def trade_pepper(self, od: OrderDepth, position: int, limit: int,
+                     timestamp: int, trader_state: dict) -> tuple[List[Order], dict]:
         orders: List[Order] = []
 
         pepper_key = "pepper_intercept"
-        pepper_count_key = "pepper_tick_count"
+        pepper_prices_key = "pepper_bootstrap_prices"
 
-        # ── Improvement #5: Weighted mid-price ───────────────────
-        mid = get_weighted_mid(od)
-        if mid is None:
+        # ── Weighted mid-price ───────────────────────────────────
+        best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
+        best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
+
+        if best_bid is not None and best_ask is not None:
+            bid_vol = abs(od.buy_orders[best_bid])
+            ask_vol = abs(od.sell_orders[best_ask])
+            if bid_vol + ask_vol > 0:
+                mid = (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
+            else:
+                mid = (best_bid + best_ask) / 2
+        elif best_bid is not None:
+            mid = float(best_bid)
+        elif best_ask is not None:
+            mid = float(best_ask)
+        else:
             return orders, trader_state
 
-        # ── Improvement #2: Trade from tick 1 ────────────────────
-        # Use expected intercept immediately, refine with EMA
+        # ── Bootstrap intercept from first 5 ticks ───────────────
+        # NEVER assume the intercept — always observe the market
+        bootstrap_n = 5
         if pepper_key not in trader_state:
-            # First tick: bootstrap from expected value
-            # Estimate intercept = mid - timestamp * slope
-            estimated_from_mid = mid - timestamp * PEPPER_SLOPE
-            # Blend with our prior expectation (weight prior more on first tick)
-            trader_state[pepper_key] = PEPPER_EXPECTED_INTERCEPT * 0.7 + estimated_from_mid * 0.3
-            trader_state[pepper_count_key] = 0
-            logger.print(f"PEPPER init intercept = {trader_state[pepper_key]:.1f}")
+            if pepper_prices_key not in trader_state:
+                trader_state[pepper_prices_key] = []
+
+            trader_state[pepper_prices_key].append({
+                "t": timestamp,
+                "mid": mid,
+            })
+
+            if len(trader_state[pepper_prices_key]) >= bootstrap_n:
+                intercepts = [
+                    obs["mid"] - obs["t"] * PEPPER_SLOPE
+                    for obs in trader_state[pepper_prices_key]
+                ]
+                trader_state[pepper_key] = sum(intercepts) / len(intercepts)
+                del trader_state[pepper_prices_key]
+                logger.print(f"PEPPER bootstrapped intercept = {trader_state[pepper_key]:.1f}")
+            else:
+                return orders, trader_state
 
         intercept = trader_state[pepper_key]
-        tick_count = trader_state.get(pepper_count_key, 0)
 
-        # ── Compute fair value ───────────────────────────────────
+        # ── Fair value + adaptive EMA ────────────────────────────
         fair = intercept + timestamp * PEPPER_SLOPE
-
-        # ── Adaptive EMA: learn faster early, slower later ───────
-        # First 20 ticks: alpha=0.1 (learn fast). After: alpha=0.01 (stable)
-        alpha = 0.1 if tick_count < 20 else 0.01
+        alpha = 0.01
         residual = mid - fair
         trader_state[pepper_key] = intercept + alpha * residual
-        trader_state[pepper_count_key] = tick_count + 1
 
-        logger.print(f"PEPPER t={timestamp} fair={fair:.1f} mid={mid:.1f} res={residual:.1f} pos={position} alpha={alpha}")
+        logger.print(f"PEPPER t={timestamp} fair={fair:.1f} mid={mid:.1f} res={residual:.1f} pos={position}")
 
-        # ── Improvement #3: Aggressive takes FIRST ───────────────
+        # ── Position-aware edge ──────────────────────────────────
+        edge = PEPPER_AGGRESSIVE_EDGE
+        if abs(position) > int(limit * 0.7):
+            edge += 1
 
-        # Improvement #6: Position-aware aggressive edge
-        pos_ratio = abs(position) / limit
-        adjusted_edge = PEPPER_AGGRESSIVE_EDGE
-        if pos_ratio > 0.7:
-            adjusted_edge = PEPPER_AGGRESSIVE_EDGE + 1
-
-        # Only take buys if we have room to go longer
+        # ── STEP 1: Aggressive takes FIRST ───────────────────────
         if od.sell_orders:
             for ask_price in sorted(od.sell_orders.keys()):
-                if ask_price < fair - adjusted_edge and position < limit:
+                if ask_price < fair - edge and position < limit:
                     ask_vol = od.sell_orders[ask_price]
-                    max_buy = limit - position
-                    buy_qty = min(-ask_vol, max_buy)
+                    buy_qty = min(-ask_vol, limit - position)
                     if buy_qty > 0:
                         orders.append(Order("INTARIAN_PEPPER_ROOT", ask_price, buy_qty))
                         position += buy_qty
                         logger.print(f"PEPPER TAKE BUY {buy_qty}x @ {ask_price} (fair={fair:.1f})")
-                elif ask_price >= fair - adjusted_edge:
+                else:
                     break
 
-        # Only take sells if we have room to go shorter
         if od.buy_orders:
             for bid_price in sorted(od.buy_orders.keys(), reverse=True):
-                if bid_price > fair + adjusted_edge and position > -limit:
+                if bid_price > fair + edge and position > -limit:
                     bid_vol = od.buy_orders[bid_price]
-                    max_sell = limit + position
-                    sell_qty = min(bid_vol, max_sell)
+                    sell_qty = min(bid_vol, limit + position)
                     if sell_qty > 0:
                         orders.append(Order("INTARIAN_PEPPER_ROOT", bid_price, -sell_qty))
                         position -= sell_qty
                         logger.print(f"PEPPER TAKE SELL {sell_qty}x @ {bid_price} (fair={fair:.1f})")
-                elif bid_price <= fair + adjusted_edge:
+                else:
                     break
 
-        # ── Passive MM with dynamic spread + trend bias ──────────
-
-        # Improvement #4: Dynamic spread
-        spread_half = get_dynamic_spread(od, PEPPER_DEFAULT_SPREAD_HALF)
-
-        # Trend bias: slight long lean since price trends up
+        # ── STEP 2: Passive quotes with REMAINING capacity ──────
         trend_bias = 1
-
-        # Inventory skew
         inv_skew = -position * 0.4
         inv_skew = max(-3, min(3, inv_skew))
 
-        # Multi-level quoting for Pepper too
-        remaining_bid = limit - position
-        remaining_ask = limit + position
+        bid_price = int(round(fair - PEPPER_SPREAD_HALF + inv_skew + trend_bias))
+        ask_price = int(round(fair + PEPPER_SPREAD_HALF + inv_skew + trend_bias))
 
-        levels = [
-            (spread_half, 0.50),
-            (spread_half + 2, 0.35),
-            (spread_half + 4, 1.00),
-        ]
+        bid_qty = limit - position
+        ask_qty = limit + position
 
-        for offset, frac in levels:
-            bid_price = int(round(fair - offset + inv_skew + trend_bias))
-            ask_price = int(round(fair + offset + inv_skew + trend_bias))
-
-            bid_qty = max(1, int(remaining_bid * frac))
-            ask_qty = max(1, int(remaining_ask * frac))
-
-            bid_qty = min(bid_qty, remaining_bid)
-            ask_qty = min(ask_qty, remaining_ask)
-
-            if bid_qty > 0:
-                orders.append(Order("INTARIAN_PEPPER_ROOT", bid_price, bid_qty))
-                remaining_bid -= bid_qty
-
-            if ask_qty > 0:
-                orders.append(Order("INTARIAN_PEPPER_ROOT", ask_price, -ask_qty))
-                remaining_ask -= ask_qty
-
-            if remaining_bid <= 0 and remaining_ask <= 0:
-                break
+        if bid_qty > 0:
+            orders.append(Order("INTARIAN_PEPPER_ROOT", bid_price, bid_qty))
+        if ask_qty > 0:
+            orders.append(Order("INTARIAN_PEPPER_ROOT", ask_price, -ask_qty))
 
         return orders, trader_state
