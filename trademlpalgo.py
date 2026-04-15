@@ -1,3 +1,4 @@
+%%writefile trader.py
 import json
 import math
 from typing import Any, List, Dict
@@ -320,38 +321,30 @@ class Logger:
 
 logger = Logger()
 
-# ═════════════════════════════════════════════════════════════════════
-#  CONFIGURATION
-# ═════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────
+#  CONFIGURATION (from 8k algo — proven params)
+# ─────────────────────────────────────────────────────────
 
 POSITION_LIMITS = {
     "ASH_COATED_OSMIUM": 80,
     "INTARIAN_PEPPER_ROOT": 80,
-    # Round 2+ products — add here when revealed
-    # "BASKET_PRODUCT": 60,
-    # "COMPONENT_A": 100,
 }
 
-# -- OSMIUM CONFIG --
-OSMIUM_FAIR         = 10_000
-OSMIUM_MM_HALF      = 1.5    # base half-spread (adjusted by regime)
-OSMIUM_TAKE_EDGE    = 2      # aggressive take threshold
-OSMIUM_INV_PENALTY  = 0.3    # inventory skew coefficient
-OSMIUM_MAX_SKEW     = 4
+OSMIUM_FAIR      = 10_000
+OSMIUM_MM_HALF   = 2
+OSMIUM_TAKE_EDGE = 3
+OSMIUM_INV_SKEW  = 0.3
+OSMIUM_MAX_SKEW  = 4
 
-# -- PEPPER CONFIG --
-PEPPER_BUY_EDGE          = 2
-PEPPER_SELL_SPIKE         = 15
-PEPPER_SELL_SPIKE_LOADED  = 8    # when position > 75% of limit
-PEPPER_SELL_SPIKE_MID     = 12   # when position > 50% of limit
-PEPPER_PASSIVE_BID_ABOVE  = 1
-
-# spread_arb = SpreadArbEngine("BASKET", {"CHOC": 4, "STRAW": 6, "ROSE": 1}, premium=380)
+PEPPER_SLOPE             = 1.0 / 1000
+PEPPER_BUY_EDGE          = 8
+PEPPER_SELL_SPIKE        = 50
+PEPPER_PASSIVE_BID_OFFSET = 2
 
 
-# ═════════════════════════════════════════════════════════════════════
-#  TRADER CLASS
-# ═════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────
+#  TRADER
+# ─────────────────────────────────────────────────────────
 
 class Trader:
 
@@ -363,8 +356,6 @@ class Trader:
                 trader_state = json.loads(state.traderData)
             except Exception:
                 trader_state = {}
-
-        conversions = 0
 
         for product in state.order_depths:
             od: OrderDepth = state.order_depths[product]
@@ -379,56 +370,48 @@ class Trader:
                         od, position, limit, state.timestamp, trader_state,
                         state.market_trades
                     )
-
-                else:
-                    result[product] = []
             except Exception as e:
                 result[product] = []
                 logger.print(f"ERROR {product}: {e}")
 
         trader_data = json.dumps(trader_state)
+        conversions = 0
         logger.flush(state, result, conversions, trader_data)
         return result, conversions, trader_data
 
     # =============================================================
-    #  ASH_COATED_OSMIUM — Simple Tight MM at 10,000
+    #  ASH_COATED_OSMIUM — Tight MM at 10,000 (8k algo, unchanged)
     # =============================================================
 
     def trade_osmium(self, od: OrderDepth, position: int, limit: int) -> List[Order]:
         orders: List[Order] = []
         fair = OSMIUM_FAIR
 
-        edge = OSMIUM_TAKE_EDGE
-        if abs(position) > int(limit * 0.7):
-            edge += 1
-
+        # Aggressive: sweep ALL mispriced levels (no break)
         if od.sell_orders:
             for ask in sorted(od.sell_orders.keys()):
-                if ask < fair - edge and position < limit:
+                if ask < fair - OSMIUM_TAKE_EDGE:
                     qty = min(-od.sell_orders[ask], limit - position)
                     if qty > 0:
                         orders.append(Order("ASH_COATED_OSMIUM", ask, qty))
                         position += qty
-                else:
-                    break
 
         if od.buy_orders:
             for bid in sorted(od.buy_orders.keys(), reverse=True):
-                if bid > fair + edge and position > -limit:
+                if bid > fair + OSMIUM_TAKE_EDGE:
                     qty = min(od.buy_orders[bid], limit + position)
                     if qty > 0:
                         orders.append(Order("ASH_COATED_OSMIUM", bid, -qty))
                         position -= qty
-                else:
-                    break
 
-        skew = -position * OSMIUM_INV_PENALTY
+        # Passive MM with inventory skew
+        skew = -position * OSMIUM_INV_SKEW
         skew = max(-OSMIUM_MAX_SKEW, min(OSMIUM_MAX_SKEW, skew))
 
         bid_px = int(round(fair - OSMIUM_MM_HALF + skew))
         ask_px = int(round(fair + OSMIUM_MM_HALF + skew))
-        bid_px = min(bid_px, int(fair) - 1)
-        ask_px = max(ask_px, int(fair) + 1)
+        bid_px = min(bid_px, fair - 1)
+        ask_px = max(ask_px, fair + 1)
 
         bid_qty = limit - position
         ask_qty = limit + position
@@ -441,90 +424,72 @@ class Trader:
         return orders
 
     # =============================================================
-    #  INTARIAN_PEPPER_ROOT    # =============================================================
-    #  INTARIAN_PEPPER_ROOT — MLP Trend Capture
+    #  INTARIAN_PEPPER_ROOT — Max Long Trend + MLP Enhancement
     #
-    #  Pipeline:
-    #    1. MLP fair value + delta prediction
-    #    2. Directional gating (don't buy into predicted drops)
-    #    3. Aggressive takes below fair + edge
-    #    4. Position-aware spike selling
-    #    5. Passive bidding for remaining capacity
+    #  Base: 8k algo's linear trend model (always max long)
+    #  Enhancement: MLP shifts fair value for better entry prices
+    #  NEVER blocks buying — the trend is deterministic
     # =============================================================
 
     def trade_pepper(self, od: OrderDepth, position: int, limit: int,
                      timestamp: int, trader_state: dict, market_trades) -> tuple:
         orders: List[Order] = []
+
         best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
         best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
         if best_bid is None and best_ask is None:
             return orders, trader_state
 
-        # ── MLP fair value ────────────────────────────────────
-        buy_edge = PEPPER_BUY_EDGE
+        mid = (best_bid + best_ask) / 2 if (best_bid and best_ask) else float(best_bid or best_ask)
+
+        # ── Bootstrap linear trend intercept ─────────────────────
+        pepper_key = "pepper_intercept"
+        if pepper_key not in trader_state:
+            trader_state[pepper_key] = mid - timestamp * PEPPER_SLOPE
+
+        intercept = trader_state[pepper_key]
+        trend_fair = intercept + timestamp * PEPPER_SLOPE
+
+        # Gently adapt intercept for day-boundary shifts
+        residual = mid - trend_fair
+        trader_state[pepper_key] = intercept + 0.005 * residual
+
+        # ── MLP enhancement: shift fair if confident ─────────────
+        fair = trend_fair
         try:
-            x, mid, trader_state = extract_features(od, market_trades, trader_state, "INTARIAN_PEPPER_ROOT")
-            if mid == 0:
-                return orders, trader_state
-            delta, confidence, cls, probs = predict_delta("INTARIAN_PEPPER_ROOT", x)
-            fair = mid + delta
+            x, mlp_mid, trader_state = extract_features(od, market_trades, trader_state, "INTARIAN_PEPPER_ROOT")
+            if mlp_mid > 0:
+                delta, confidence, cls, probs = predict_delta("INTARIAN_PEPPER_ROOT", x)
+                # Blend MLP into fair — small nudge, never dominates
+                if confidence > 0.3:
+                    fair = trend_fair + delta * 0.5  # half-weight the MLP shift
+        except Exception:
+            pass  # MLP failure is fine, trend model carries us
 
-            # Directional gating
-            if delta > 0.5:
-                buy_edge = PEPPER_BUY_EDGE + 2   # aggressive buy on strong up signal
-            elif delta < -0.5:
-                buy_edge = -999                   # BLOCK buying on down signal
-            elif delta < 0:
-                buy_edge = PEPPER_BUY_EDGE - 1    # cautious on weak down signal
-            else:
-                buy_edge = PEPPER_BUY_EDGE
+        logger.print(f"PEPPER t={timestamp} fair={fair:.1f} trend={trend_fair:.1f} mid={mid:.1f} pos={position}")
 
-            logger.print(
-                f"PEPPER t={timestamp} fair={fair:.1f} mid={mid:.1f}"
-                f" d={delta} conf={confidence:.2f} edge={buy_edge} pos={position}"
-            )
-        except Exception as e:
-            if best_bid is not None and best_ask is not None:
-                mid = (best_bid + best_ask) / 2
-            else:
-                mid = float(best_bid or best_ask)
-            fair = mid
-            logger.print(f"PEPPER MLP fallback fair={fair:.1f} err={e}")
-
-        # ── 1. Aggressive BUY ─────────────────────────────────
-        if od.sell_orders and buy_edge > -900:
+        # ── 1. Aggressive BUY: always buy, never gate ────────────
+        if od.sell_orders:
             for ask in sorted(od.sell_orders.keys()):
-                if ask <= fair + buy_edge and position < limit:
+                if ask <= fair + PEPPER_BUY_EDGE:
                     qty = min(-od.sell_orders[ask], limit - position)
                     if qty > 0:
                         orders.append(Order("INTARIAN_PEPPER_ROOT", ask, qty))
                         position += qty
-                        logger.print(f"PEPPER BUY {qty}@{ask}")
-                else:
-                    break
 
-        # ── 2. Position-aware spike selling ────────────────────
-        sell_threshold = PEPPER_SELL_SPIKE
-        if position > int(limit * 0.75):
-            sell_threshold = PEPPER_SELL_SPIKE_LOADED
-        elif position > int(limit * 0.5):
-            sell_threshold = PEPPER_SELL_SPIKE_MID
-
+        # ── 2. Spike sell: only on massive deviation ─────────────
         if od.buy_orders and position > 0:
             for bid in sorted(od.buy_orders.keys(), reverse=True):
-                if bid > fair + sell_threshold:
+                if bid > fair + PEPPER_SELL_SPIKE:
                     qty = min(od.buy_orders[bid], position)
                     if qty > 0:
                         orders.append(Order("INTARIAN_PEPPER_ROOT", bid, -qty))
                         position -= qty
-                        logger.print(f"PEPPER SELL {qty}@{bid} threshold={sell_threshold}")
-                else:
-                    break
 
-        # ── 3. Passive BUY ────────────────────────────────────
+        # ── 3. Passive BUY: aggressive bid to fill remaining ─────
         remaining = limit - position
-        if remaining > 0 and buy_edge > -900:
-            passive_bid = int(round(fair + PEPPER_PASSIVE_BID_ABOVE))
+        if remaining > 0:
+            passive_bid = int(round(fair + PEPPER_PASSIVE_BID_OFFSET))
             if best_ask is not None:
                 passive_bid = min(passive_bid, best_ask - 1)
             orders.append(Order("INTARIAN_PEPPER_ROOT", passive_bid, remaining))
