@@ -1,4 +1,3 @@
-%%writefile trader.py
 import json
 import math
 from typing import Any, List, Dict
@@ -324,34 +323,520 @@ class Logger:
         return out
 
 
+# ═════════════════════════════════════════════════════════════════════
+#  V9 — INSTITUTIONAL-GRADE TRADING FRAMEWORK
+#  
+#  Modules:
+#    1. Wall-Mid Estimator      — detect MM bot walls for true fair value
+#    2. Taker Bot Detector      — front-run hidden taker bots
+#    3. Regime Detector          — Bayesian HMM for mean-rev vs trending
+#    4. Utility-Optimal Quoter  — multi-level quoting with fill probability
+#    5. Spread Arb Engine       — ETF/basket arbitrage (Round 2+ ready)
+#    6. Conversion Arb Engine   — foreign market arbitrage (Round 3+ ready)
+#    7. Signal Trader           — observation-based signal trading (Round 4+)
+# ═════════════════════════════════════════════════════════════════════
+
 logger = Logger()
 
-# ---------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────
+#  1. WALL-MID ESTIMATOR
+#  
+#  IMC bots place "wall" orders — deep liquidity at rounded
+#  offsets from the true price. The wall-mid is more accurate
+#  than raw mid, especially for pegged products like Osmium.
+# ─────────────────────────────────────────────────────────
+
+def estimate_wall_mid(od: OrderDepth, fallback_fair: float) -> float:
+    """
+    Scan the order book for price levels with abnormally large volume.
+    These 'walls' are placed by MM bots at rounded offsets from the true price.
+    Average bid-wall and ask-wall = best estimate of true price.
+    """
+    if not od.buy_orders or not od.sell_orders:
+        return fallback_fair
+
+    # Find the bid level with max volume
+    bid_wall_price = max(od.buy_orders.keys(), key=lambda p: od.buy_orders[p])
+    bid_wall_vol = od.buy_orders[bid_wall_price]
+
+    # Find the ask level with max volume (volumes are negative in sell_orders)
+    ask_wall_price = min(od.sell_orders.keys(), key=lambda p: od.sell_orders[p])  # most negative = largest
+    ask_wall_vol = abs(od.sell_orders[ask_wall_price])
+
+    # Only trust walls if they have meaningfully more volume than other levels
+    bid_vols = list(od.buy_orders.values())
+    ask_vols = [abs(v) for v in od.sell_orders.values()]
+
+    bid_mean = sum(bid_vols) / len(bid_vols) if bid_vols else 0
+    ask_mean = sum(ask_vols) / len(ask_vols) if ask_vols else 0
+
+    # Wall must be at least 1.5x the average level volume
+    bid_is_wall = bid_wall_vol > bid_mean * 1.5 and len(bid_vols) > 1
+    ask_is_wall = ask_wall_vol > ask_mean * 1.5 and len(ask_vols) > 1
+
+    if bid_is_wall and ask_is_wall:
+        return (bid_wall_price + ask_wall_price) / 2.0
+    elif bid_is_wall:
+        return bid_wall_price + 1.0  # estimate: wall is 1 tick below fair
+    elif ask_is_wall:
+        return ask_wall_price - 1.0
+    else:
+        return fallback_fair
+
+
+# ─────────────────────────────────────────────────────────
+#  2. TAKER BOT DETECTOR
+#  
+#  IMC places hidden taker bots that sweep best asks near
+#  the bid. If detected, we post asks just inside the spread
+#  to get hit by the bot for free edge.
+# ─────────────────────────────────────────────────────────
+
+class TakerBotDetector:
+    """
+    Track market trades to identify patterns where a consistent
+    buyer/seller sweeps the book at predictable price levels.
+    """
+    @staticmethod
+    def detect(market_trades: list, od: OrderDepth, trader_state: dict, product: str) -> dict:
+        key = f"taker_bot_{product}"
+        state = trader_state.get(key, {"buy_hits": 0, "sell_hits": 0, "total_ticks": 0})
+        state["total_ticks"] = state.get("total_ticks", 0) + 1
+
+        best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
+        best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
+
+        if market_trades:
+            for trade in market_trades:
+                # A taker buy at best_ask suggests aggressive buyer bot
+                if best_ask is not None and trade.price == best_ask:
+                    state["buy_hits"] = state.get("buy_hits", 0) + 1
+                # A taker sell at best_bid suggests aggressive seller bot
+                if best_bid is not None and trade.price == best_bid:
+                    state["sell_hits"] = state.get("sell_hits", 0) + 1
+
+        ticks = max(state["total_ticks"], 1)
+        state["buy_freq"] = state.get("buy_hits", 0) / ticks
+        state["sell_freq"] = state.get("sell_hits", 0) / ticks
+
+        trader_state[key] = state
+        return state
+
+
+# ─────────────────────────────────────────────────────────
+#  3. REGIME DETECTOR — Bayesian HMM
+#  
+#  Two regimes: MEAN_REVERT (0) vs TRENDING (1)
+#  Update posterior each tick from price changes.
+#  Adjusts MM behaviour: tight quotes in MR, wide in trend.
+# ─────────────────────────────────────────────────────────
+
+class RegimeDetector:
+    # Transition probabilities (regimes are sticky)
+    P_STAY_MR = 0.97       # P(MR→MR)
+    P_STAY_TR = 0.93       # P(TR→TR)
+
+    # Observation model: price changes
+    # Mean-revert regime: small changes (σ ~ 2)
+    # Trending regime: larger changes (σ ~ 6)
+    MR_SIGMA = 2.0
+    TR_SIGMA = 6.0
+
+    @staticmethod
+    def _gaussian_pdf(x: float, mu: float, sigma: float) -> float:
+        return math.exp(-0.5 * ((x - mu) / sigma) ** 2) / (sigma * 2.5066)
+
+    @staticmethod
+    def update(price_change: float, trader_state: dict, product: str) -> float:
+        """
+        Returns P(mean_reverting) — probability we're in MR regime.
+        Higher = quote tighter. Lower = quote wider / follow trend.
+        """
+        key = f"regime_{product}"
+        p_mr = trader_state.get(key, 0.7)  # prior: start assuming MR
+
+        # Predict step (transition)
+        p_mr_pred = p_mr * RegimeDetector.P_STAY_MR + (1 - p_mr) * (1 - RegimeDetector.P_STAY_TR)
+        p_tr_pred = 1 - p_mr_pred
+
+        # Update step (observation likelihood)
+        lik_mr = RegimeDetector._gaussian_pdf(price_change, 0, RegimeDetector.MR_SIGMA)
+        lik_tr = RegimeDetector._gaussian_pdf(price_change, 0, RegimeDetector.TR_SIGMA)
+
+        # Posterior
+        denom = lik_mr * p_mr_pred + lik_tr * p_tr_pred
+        if denom < 1e-15:
+            p_mr_post = 0.5
+        else:
+            p_mr_post = (lik_mr * p_mr_pred) / denom
+
+        # Clamp to avoid numerical extremes
+        p_mr_post = max(0.05, min(0.95, p_mr_post))
+
+        trader_state[key] = p_mr_post
+        return p_mr_post
+
+
+# ─────────────────────────────────────────────────────────
+#  4. UTILITY-OPTIMAL MULTI-LEVEL QUOTER
+#  
+#  Instead of one bid/one ask, post 2-3 levels per side.
+#  Each level optimises: E[PnL] = edge × P(fill) - inventory_cost
+#  Wider levels have more edge but lower fill probability.
+# ─────────────────────────────────────────────────────────
+
+class UtilityQuoter:
+    @staticmethod
+    def generate_quotes(
+        fair: float,
+        position: int,
+        limit: int,
+        p_mean_revert: float,
+        spread_half: float = 2.0,
+        n_levels: int = 3,
+        level_step: float = 1.0,
+        inv_penalty: float = 0.3,
+        max_skew: float = 4.0,
+    ) -> tuple:
+        """
+        Generate multi-level bid/ask quotes.
+        Returns: ([(price, qty), ...], [(price, qty), ...])  for bids and asks.
+        """
+        # Inventory skew: shift quotes to offload position
+        skew = -position * inv_penalty
+        skew = max(-max_skew, min(max_skew, skew))
+
+        # Regime adjustment: widen spread in trending, tighten in MR
+        regime_mult = 0.7 + 0.6 * (1 - p_mean_revert)  # MR→0.7x, TR→1.3x
+        adj_half = spread_half * regime_mult
+
+        bids = []
+        asks = []
+
+        remaining_bid_qty = limit - position
+        remaining_ask_qty = limit + position
+
+        for level in range(n_levels):
+            offset = adj_half + level * level_step
+
+            # Fill probability decays with distance from fair
+            # (approximate: exponential decay)
+            fill_prob = math.exp(-0.3 * level)
+
+            # Allocate more qty to closer levels (higher fill prob)
+            qty_frac = fill_prob / max(sum(math.exp(-0.3 * i) for i in range(n_levels)), 1e-6)
+
+            bid_px = int(round(fair - offset + skew))
+            ask_px = int(round(fair + offset + skew))
+
+            # Ensure ask > bid always
+            if ask_px <= bid_px:
+                ask_px = bid_px + 1
+
+            bid_qty = max(1, int(remaining_bid_qty * qty_frac))
+            ask_qty = max(1, int(remaining_ask_qty * qty_frac))
+
+            if remaining_bid_qty > 0 and bid_qty > 0:
+                bids.append((bid_px, min(bid_qty, remaining_bid_qty)))
+                remaining_bid_qty -= min(bid_qty, remaining_bid_qty)
+
+            if remaining_ask_qty > 0 and ask_qty > 0:
+                asks.append((ask_px, min(ask_qty, remaining_ask_qty)))
+                remaining_ask_qty -= min(ask_qty, remaining_ask_qty)
+
+        # Dump any remaining qty at the widest level
+        if remaining_bid_qty > 0 and bids:
+            widest_bid = bids[-1][0] - 1
+            bids.append((widest_bid, remaining_bid_qty))
+        if remaining_ask_qty > 0 and asks:
+            widest_ask = asks[-1][0] + 1
+            asks.append((widest_ask, remaining_ask_qty))
+
+        return bids, asks
+
+
+# ─────────────────────────────────────────────────────────
+#  5. SPREAD ARB ENGINE — ETF / Basket Products
+#  
+#  Ready for Round 2+. When a basket product is introduced
+#  (e.g., BASKET = w1*A + w2*B + w3*C), trade the spread
+#  between basket price and synthetic price.
+# ─────────────────────────────────────────────────────────
+
+class SpreadArbEngine:
+    """
+    Generic spread arb between a composite product and its components.
+    Configure with weights dict: {"COMPONENT_A": 4, "COMPONENT_B": 6, "COMPONENT_C": 1}
+    """
+    def __init__(self, basket_symbol: str, weights: dict, premium: float = 0.0):
+        self.basket_symbol = basket_symbol
+        self.weights = weights  # {component_symbol: quantity_in_basket}
+        self.premium = premium  # mean spread offset (estimate from data)
+
+    def compute_synthetic(self, order_depths: dict) -> tuple:
+        """Compute synthetic bid and ask from component order books."""
+        synth_bid = 0.0
+        synth_ask = 0.0
+
+        for comp, weight in self.weights.items():
+            if comp not in order_depths:
+                return None, None
+            od = order_depths[comp]
+            if not od.buy_orders or not od.sell_orders:
+                return None, None
+            synth_bid += max(od.buy_orders.keys()) * weight
+            synth_ask += min(od.sell_orders.keys()) * weight
+
+        return synth_bid, synth_ask
+
+    def compute_spread(self, basket_mid: float, synth_mid: float) -> float:
+        """spread = basket - synthetic - premium"""
+        return basket_mid - synth_mid - self.premium
+
+    def generate_orders(self, order_depths: dict, positions: dict,
+                        limits: dict, trader_state: dict) -> dict:
+        """
+        Returns dict of {symbol: [Order, ...]} for basket + all components.
+        Trades when spread deviates beyond threshold.
+        """
+        result = {self.basket_symbol: []}
+        for comp in self.weights:
+            result[comp] = []
+
+        basket_od = order_depths.get(self.basket_symbol)
+        if not basket_od or not basket_od.buy_orders or not basket_od.sell_orders:
+            return result
+
+        basket_bid = max(basket_od.buy_orders.keys())
+        basket_ask = min(basket_od.sell_orders.keys())
+        basket_mid = (basket_bid + basket_ask) / 2
+
+        synth_bid, synth_ask = self.compute_synthetic(order_depths)
+        if synth_bid is None:
+            return result
+
+        synth_mid = (synth_bid + synth_ask) / 2
+        spread = self.compute_spread(basket_mid, synth_mid)
+
+        # Track spread history for z-score
+        key = f"spread_hist_{self.basket_symbol}"
+        hist = trader_state.get(key, [])
+        hist.append(spread)
+        if len(hist) > 200:
+            hist = hist[-200:]
+        trader_state[key] = hist
+
+        if len(hist) < 20:
+            return result  # need history first
+
+        mean_spread = sum(hist) / len(hist)
+        std_spread = max((sum((x - mean_spread) ** 2 for x in hist) / len(hist)) ** 0.5, 0.1)
+        z_score = (spread - mean_spread) / std_spread
+
+        logger.print(f"SPREAD {self.basket_symbol} z={z_score:.2f} spread={spread:.1f} mean={mean_spread:.1f}")
+
+        ENTRY_Z = 2.0
+        basket_pos = positions.get(self.basket_symbol, 0)
+        basket_limit = limits.get(self.basket_symbol, 60)
+
+        if z_score > ENTRY_Z and basket_pos > -basket_limit:
+            # Spread too wide → sell basket, buy components
+            sell_qty = min(abs(basket_od.buy_orders.get(basket_bid, 0)), basket_limit + basket_pos)
+            if sell_qty > 0:
+                result[self.basket_symbol].append(Order(self.basket_symbol, basket_bid, -sell_qty))
+                # Buy components proportionally
+                for comp, weight in self.weights.items():
+                    comp_od = order_depths[comp]
+                    comp_ask = min(comp_od.sell_orders.keys())
+                    comp_pos = positions.get(comp, 0)
+                    comp_limit = limits.get(comp, 80)
+                    comp_qty = min(sell_qty * weight, comp_limit - comp_pos)
+                    if comp_qty > 0:
+                        result[comp].append(Order(comp, comp_ask, int(comp_qty)))
+
+        elif z_score < -ENTRY_Z and basket_pos < basket_limit:
+            # Spread too narrow → buy basket, sell components
+            buy_qty = min(abs(basket_od.sell_orders.get(basket_ask, 0)), basket_limit - basket_pos)
+            if buy_qty > 0:
+                result[self.basket_symbol].append(Order(self.basket_symbol, basket_ask, buy_qty))
+                for comp, weight in self.weights.items():
+                    comp_od = order_depths[comp]
+                    comp_bid = max(comp_od.buy_orders.keys())
+                    comp_pos = positions.get(comp, 0)
+                    comp_limit = limits.get(comp, 80)
+                    comp_qty = min(buy_qty * weight, comp_limit + comp_pos)
+                    if comp_qty > 0:
+                        result[comp].append(Order(comp, comp_bid, -int(comp_qty)))
+
+        return result
+
+
+# ─────────────────────────────────────────────────────────
+#  6. CONVERSION ARB ENGINE
+#  
+#  Ready for Round 3+. Exploits conversionObservations to
+#  arb between local market and foreign market.
+# ─────────────────────────────────────────────────────────
+
+class ConversionArbEngine:
+    """
+    Arbitrage between local order book and foreign conversion market.
+    Uses: obs.bidPrice, obs.askPrice, obs.transportFees,
+          obs.exportTariff, obs.importTariff
+    """
+    @staticmethod
+    def compute_arb(od: OrderDepth, obs, position: int, limit: int,
+                    max_conversions: int = 10) -> tuple:
+        """
+        Returns: (orders: List[Order], conversions: int)
+        
+        Import arb: buy foreign (ask + transport + import) → sell local (bid)
+        Export arb: buy local (ask) → sell foreign (bid - transport - export)
+        """
+        orders = []
+        conversions = 0
+
+        if obs is None or not od.buy_orders or not od.sell_orders:
+            return orders, conversions
+
+        local_bid = max(od.buy_orders.keys())
+        local_ask = min(od.sell_orders.keys())
+
+        # Foreign costs
+        foreign_ask = obs.askPrice  # cost to buy from foreign
+        foreign_bid = obs.bidPrice  # revenue from selling to foreign
+        transport = obs.transportFees
+        import_tariff = obs.importTariff
+        export_tariff = obs.exportTariff
+
+        # Import arb: buy foreign → sell locally
+        import_cost = foreign_ask + transport + import_tariff
+        import_profit = local_bid - import_cost
+
+        # Export arb: buy locally → sell foreign
+        export_revenue = foreign_bid - transport - export_tariff
+        export_profit = export_revenue - local_ask
+
+        if import_profit > 0:
+            # Convert (import) then sell locally
+            conv_qty = min(max_conversions, limit + position)  # conversion creates long
+            if conv_qty > 0:
+                conversions = conv_qty
+                # Sell the converted units locally
+                sell_qty = min(conv_qty, od.buy_orders.get(local_bid, 0), limit + position)
+                if sell_qty > 0:
+                    orders.append(Order("__PLACEHOLDER__", local_bid, -sell_qty))
+
+        elif export_profit > 0:
+            # Buy locally then convert (export)
+            conv_qty = min(max_conversions, limit - position)
+            if conv_qty > 0:
+                conversions = -conv_qty  # negative = export
+                buy_qty = min(conv_qty, abs(od.sell_orders.get(local_ask, 0)), limit - position)
+                if buy_qty > 0:
+                    orders.append(Order("__PLACEHOLDER__", local_ask, buy_qty))
+
+        return orders, conversions
+
+
+# ─────────────────────────────────────────────────────────
+#  7. SIGNAL TRADER
+#  
+#  Ready for Round 4+. Trades a product based on derivative
+#  of an external observation signal (e.g., sunlight → crop).
+# ─────────────────────────────────────────────────────────
+
+class SignalTrader:
+    @staticmethod
+    def trade_on_signal(
+        signal_value: float,
+        trader_state: dict,
+        signal_key: str,
+        od: OrderDepth,
+        product: str,
+        position: int,
+        limit: int,
+        buy_threshold: float = 0.002,
+        sell_threshold: float = -0.002,
+        lookback: int = 10,
+    ) -> tuple:
+        """
+        Track a signal over time, compute its derivative,
+        and trade when the derivative exceeds thresholds.
+        Returns: (orders, trader_state)
+        """
+        orders = []
+        hist_key = f"signal_hist_{signal_key}"
+        hist = trader_state.get(hist_key, [])
+        hist.append(signal_value)
+        if len(hist) > 100:
+            hist = hist[-100:]
+        trader_state[hist_key] = hist
+
+        if len(hist) < lookback + 1:
+            return orders, trader_state
+
+        # Compute normalised derivative
+        recent = hist[-lookback:]
+        derivative = (recent[-1] - recent[0]) / max(abs(recent[0]), 1e-6) / lookback
+
+        best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
+        best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
+
+        if derivative > buy_threshold and best_ask is not None and position < limit:
+            qty = min(abs(od.sell_orders.get(best_ask, 0)), limit - position)
+            if qty > 0:
+                orders.append(Order(product, best_ask, qty))
+                logger.print(f"SIGNAL BUY {product} {qty}@{best_ask} deriv={derivative:.5f}")
+
+        elif derivative < sell_threshold and best_bid is not None and position > -limit:
+            qty = min(od.buy_orders.get(best_bid, 0), limit + position)
+            if qty > 0:
+                orders.append(Order(product, best_bid, -qty))
+                logger.print(f"SIGNAL SELL {product} {qty}@{best_bid} deriv={derivative:.5f}")
+
+        return orders, trader_state
+
+
+# ═════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
-# ---------------------------------------------------------------------
+# ═════════════════════════════════════════════════════════════════════
 
 POSITION_LIMITS = {
     "ASH_COATED_OSMIUM": 80,
     "INTARIAN_PEPPER_ROOT": 80,
+    # Round 2+ products — add here when revealed
+    # "BASKET_PRODUCT": 60,
+    # "COMPONENT_A": 100,
 }
 
-# -- OSMIUM: tight MM (from teammate) + position-aware edge (from us) --
-OSMIUM_FAIR      = 10_000
-OSMIUM_MM_HALF   = 1       # Tight quotes: 9999 / 10001
-OSMIUM_TAKE_EDGE = 2       # Take anything beyond ±3=2 from fair
-OSMIUM_INV_SKEW  = 0.3     # Gentle skew
-OSMIUM_MAX_SKEW  = 4
+# -- OSMIUM CONFIG --
+OSMIUM_FAIR         = 10_000
+OSMIUM_MM_HALF      = 1.5    # base half-spread (adjusted by regime)
+OSMIUM_TAKE_EDGE    = 2      # aggressive take threshold
+OSMIUM_N_LEVELS     = 3      # multi-level quoting
+OSMIUM_LEVEL_STEP   = 1.0    # price step between quote levels
+OSMIUM_INV_PENALTY  = 0.3    # inventory skew coefficient
+OSMIUM_MAX_SKEW     = 4
 
-# -- PEPPER: max-long trend capture (from teammate) -------------------
-PEPPER_SLOPE             = 1.0 / 1000
-PEPPER_BUY_EDGE          = 2     # Buy even at fair+2 - trend recovers in 8s
-PEPPER_SELL_SPIKE        = 15    # Only sell on massive spikes
-PEPPER_PASSIVE_BID_ABOVE = 1     # Bid at fair+1 to attract sellers
+# -- PEPPER CONFIG --
+PEPPER_BUY_EDGE          = 2
+PEPPER_SELL_SPIKE         = 15
+PEPPER_SELL_SPIKE_LOADED  = 8    # when position > 75% of limit
+PEPPER_SELL_SPIKE_MID     = 12   # when position > 50% of limit
+PEPPER_PASSIVE_BID_ABOVE  = 1
+
+# -- SPREAD ARB CONFIG (activate when Round 2 products revealed) --
+# Example: BASKET = 4×CHOC + 6×STRAW + 1×ROSE
+# spread_arb = SpreadArbEngine("BASKET", {"CHOC": 4, "STRAW": 6, "ROSE": 1}, premium=380)
+
+# -- CONVERSION ARB CONFIG (activate when Round 3+ products revealed) --
+# MAX_CONVERSIONS = 10  # typical IMC rate limit
 
 
-# ---------------------------------------------------------------------
-#  TRADER
-# ---------------------------------------------------------------------
+# ═════════════════════════════════════════════════════════════════════
+#  TRADER CLASS
+# ═════════════════════════════════════════════════════════════════════
 
 class Trader:
 
@@ -363,44 +848,146 @@ class Trader:
                 trader_state = json.loads(state.traderData)
             except Exception:
                 trader_state = {}
+
+        conversions = 0
+
         for product in state.order_depths:
             od: OrderDepth = state.order_depths[product]
             position = state.position.get(product, 0)
             limit = POSITION_LIMITS.get(product, 80)
+
             try:
                 if product == "ASH_COATED_OSMIUM":
-                    result[product] = self.trade_osmium(od, position, limit)
+                    result[product], trader_state = self.trade_osmium(
+                        od, position, limit, state.timestamp, trader_state,
+                        state.market_trades, state
+                    )
                 elif product == "INTARIAN_PEPPER_ROOT":
                     result[product], trader_state = self.trade_pepper(
                         od, position, limit, state.timestamp, trader_state,
                         state.market_trades
                     )
+                # ── Round 2+ skeleton ──────────────────────────
+                # elif product == "BASKET_PRODUCT":
+                #     spread_result = spread_arb.generate_orders(
+                #         state.order_depths, state.position,
+                #         POSITION_LIMITS, trader_state
+                #     )
+                #     for sym, orders in spread_result.items():
+                #         result[sym] = result.get(sym, []) + orders
+                #
+                # ── Round 3+ conversion arb ────────────────────
+                # elif product == "CONVERSION_PRODUCT":
+                #     obs = state.observations.conversionObservations.get(product)
+                #     conv_orders, conv = ConversionArbEngine.compute_arb(
+                #         od, obs, position, limit
+                #     )
+                #     # Fix placeholder symbol
+                #     result[product] = [Order(product, o.price, o.quantity) for o in conv_orders]
+                #     conversions = conv
+                #
+                # ── Round 4+ signal trading ────────────────────
+                # elif product == "SIGNAL_DRIVEN_PRODUCT":
+                #     signal_val = state.observations.plainValueObservations.get("SIGNAL_NAME", 0)
+                #     result[product], trader_state = SignalTrader.trade_on_signal(
+                #         signal_val, trader_state, "SIGNAL_NAME",
+                #         od, product, position, limit
+                #     )
+                else:
+                    result[product] = []
             except Exception as e:
                 result[product] = []
                 logger.print(f"ERROR {product}: {e}")
+
         trader_data = json.dumps(trader_state)
-        conversions = 0
         logger.flush(state, result, conversions, trader_data)
         return result, conversions, trader_data
 
     # =============================================================
-    #  ASH_COATED_OSMIUM - Tight MM + Position-Aware Edge
+    #  ASH_COATED_OSMIUM — Institutional-Grade MM
     #
-    #  Teammate's ±2 spread (tighter = more fills on live)
-    #  + Our position-aware edge (protective when loaded)
-    #  + Aggressive-first ordering (from our v3)
+    #  Pipeline:
+    #    1. Wall-mid estimation → true fair value
+    #    2. MLP delta prediction → directional adjustment
+    #    3. Regime detection → spread width adjustment
+    #    4. Taker bot detection → front-running opportunity
+    #    5. Aggressive takes at mispriced levels
+    #    6. Multi-level passive quoting with utility optimization
     # =============================================================
 
-    def trade_osmium(self, od: OrderDepth, position: int, limit: int) -> List[Order]:
+    def trade_osmium(self, od: OrderDepth, position: int, limit: int,
+                     timestamp: int, trader_state: dict, market_trades,
+                     state: TradingState) -> tuple:
         orders: List[Order] = []
-        fair = OSMIUM_FAIR
 
-        # Position-aware aggressive edge (from our v3)
+        # ── STEP 0: Compute best bid/ask ───────────────────────
+        best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
+        best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
+        if best_bid is None and best_ask is None:
+            return orders, trader_state
+
+        raw_mid = (best_bid + best_ask) / 2 if (best_bid and best_ask) else OSMIUM_FAIR
+
+        # ── STEP 1: Wall-mid estimation ────────────────────────
+        wall_mid = estimate_wall_mid(od, OSMIUM_FAIR)
+
+        # ── STEP 2: MLP fair value ────────────────────────────
+        mlp_fair = raw_mid
+        mlp_delta = 0.0
+        mlp_conf = 0.0
+        try:
+            x, mid, trader_state = extract_features(od, market_trades, trader_state, "ASH_COATED_OSMIUM")
+            if mid > 0:
+                delta, confidence, cls, probs = predict_delta("ASH_COATED_OSMIUM", x)
+                mlp_delta = delta
+                mlp_conf = confidence
+                if confidence > 0.25:
+                    mlp_fair = mid + delta
+                else:
+                    mlp_fair = mid
+        except Exception as e:
+            logger.print(f"OSM MLP err: {e}")
+
+        # ── STEP 3: Combine fair values ────────────────────────
+        # Weighted blend: wall_mid is structural, MLP is predictive
+        # Higher MLP confidence → more weight on MLP
+        mlp_weight = min(mlp_conf, 0.6)  # cap MLP influence
+        wall_weight = 1.0 - mlp_weight
+        fair = wall_mid * wall_weight + mlp_fair * mlp_weight
+
+        # ── STEP 4: Regime detection ──────────────────────────
+        prev_mid = trader_state.get("osm_prev_mid", fair)
+        price_change = fair - prev_mid
+        trader_state["osm_prev_mid"] = fair
+
+        p_mr = RegimeDetector.update(price_change, trader_state, "ASH_COATED_OSMIUM")
+
+        # ── STEP 5: Taker bot detection ────────────────────────
+        osm_trades = market_trades.get("ASH_COATED_OSMIUM", [])
+        bot_state = TakerBotDetector.detect(osm_trades, od, trader_state, "ASH_COATED_OSMIUM")
+
+        logger.print(
+            f"OSM t={timestamp} fair={fair:.1f} wall={wall_mid:.1f} mlp={mlp_fair:.1f}"
+            f" d={mlp_delta} conf={mlp_conf:.2f} p_mr={p_mr:.2f}"
+            f" bot_buy={bot_state.get('buy_freq', 0):.2f} pos={position}"
+        )
+
+        # ── STEP 6: Aggressive takes ──────────────────────────
         edge = OSMIUM_TAKE_EDGE
         if abs(position) > int(limit * 0.7):
-            edge += 1
+            edge += 1  # widen when loaded
 
-        # -- STEP 1: Aggressive takes first -----------------------
+        # Taker bot front-run: if bot buys frequently, post asks aggressively
+        if bot_state.get("buy_freq", 0) > 0.3 and best_ask is not None:
+            # Post ask at best_ask - 1 to get hit by taker bot
+            front_run_ask = best_ask - 1
+            if front_run_ask > fair and position > -limit:
+                fr_qty = min(5, limit + position)
+                if fr_qty > 0:
+                    orders.append(Order("ASH_COATED_OSMIUM", front_run_ask, -fr_qty))
+                    position -= fr_qty
+                    logger.print(f"OSM FRONT-RUN ASK {fr_qty}@{front_run_ask}")
+
         if od.sell_orders:
             for ask in sorted(od.sell_orders.keys()):
                 if ask < fair - edge and position < limit:
@@ -423,91 +1010,114 @@ class Trader:
                 else:
                     break
 
-        # -- STEP 2: Tight passive MM with remaining capacity -----
-        skew = -position * OSMIUM_INV_SKEW
-        skew = max(-OSMIUM_MAX_SKEW, min(OSMIUM_MAX_SKEW, skew))
+        # ── STEP 7: Multi-level passive quoting ────────────────
+        bids, asks = UtilityQuoter.generate_quotes(
+            fair=fair,
+            position=position,
+            limit=limit,
+            p_mean_revert=p_mr,
+            spread_half=OSMIUM_MM_HALF,
+            n_levels=OSMIUM_N_LEVELS,
+            level_step=OSMIUM_LEVEL_STEP,
+            inv_penalty=OSMIUM_INV_PENALTY,
+            max_skew=OSMIUM_MAX_SKEW,
+        )
 
-        bid_px = int(round(fair - OSMIUM_MM_HALF + skew))
-        ask_px = int(round(fair + OSMIUM_MM_HALF + skew))
+        for px, qty in bids:
+            if qty > 0:
+                orders.append(Order("ASH_COATED_OSMIUM", px, qty))
+        for px, qty in asks:
+            if qty > 0:
+                orders.append(Order("ASH_COATED_OSMIUM", px, -qty))
 
-        bid_px = min(bid_px, fair - 1)
-        ask_px = max(ask_px, fair + 1)
-
-        bid_qty = limit - position
-        ask_qty = limit + position
-
-        if bid_qty > 0:
-            orders.append(Order("ASH_COATED_OSMIUM", bid_px, bid_qty))
-        if ask_qty > 0:
-            orders.append(Order("ASH_COATED_OSMIUM", ask_px, -ask_qty))
-
-        return orders
+        return orders, trader_state
 
     # =============================================================
-    #  INTARIAN_PEPPER_ROOT - Max Long Trend Capture
+    #  INTARIAN_PEPPER_ROOT — MLP Trend Capture
     #
-    #  Teammate's core insight: hold max long, trend does the work.
-    #  + Our weighted mid for more accurate fair value
-    #  + Slightly faster EMA adaptation (0.008 vs 0.005)
+    #  Pipeline:
+    #    1. MLP fair value + delta prediction
+    #    2. Directional gating (don't buy into predicted drops)
+    #    3. Aggressive takes below fair + edge
+    #    4. Position-aware spike selling
+    #    5. Passive bidding for remaining capacity
     # =============================================================
 
     def trade_pepper(self, od: OrderDepth, position: int, limit: int,
-                 timestamp: int, trader_state: dict, market_trades) -> tuple[List[Order], dict]:
+                     timestamp: int, trader_state: dict, market_trades) -> tuple:
         orders: List[Order] = []
         best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
         best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
         if best_bid is None and best_ask is None:
             return orders, trader_state
 
-       # -- MLP fair value ----------------------------------------
+        # ── MLP fair value ────────────────────────────────────
+        buy_edge = PEPPER_BUY_EDGE
         try:
-            x, mid = extract_features(od, market_trades, trader_state, "INTARIAN_PEPPER_ROOT")
+            x, mid, trader_state = extract_features(od, market_trades, trader_state, "INTARIAN_PEPPER_ROOT")
             if mid == 0:
                 return orders, trader_state
-            fair = predict_price("INTARIAN_PEPPER_ROOT", x, mid)
-            delta = predict_delta("INTARIAN_PEPPER_ROOT", x)
+            delta, confidence, cls, probs = predict_delta("INTARIAN_PEPPER_ROOT", x)
+            fair = mid + delta
+
+            # Directional gating
             if delta > 0.5:
-                buy_edge = PEPPER_BUY_EDGE + 2
+                buy_edge = PEPPER_BUY_EDGE + 2   # aggressive buy on strong up signal
+            elif delta < -0.5:
+                buy_edge = -999                   # BLOCK buying on down signal
+            elif delta < 0:
+                buy_edge = PEPPER_BUY_EDGE - 1    # cautious on weak down signal
             else:
-                buy_edge = PEPPER_BUY_EDGE - 1
-        except:
-            # Fallback to simple mid
+                buy_edge = PEPPER_BUY_EDGE
+
+            logger.print(
+                f"PEPPER t={timestamp} fair={fair:.1f} mid={mid:.1f}"
+                f" d={delta} conf={confidence:.2f} edge={buy_edge} pos={position}"
+            )
+        except Exception as e:
             if best_bid is not None and best_ask is not None:
                 mid = (best_bid + best_ask) / 2
             else:
                 mid = float(best_bid or best_ask)
             fair = mid
-            buy_edge = PEPPER_BUY_EDGE
-    
-        logger.print(f"PEPPER t={timestamp} fair={fair:.1f} mid={mid:.1f} pos={position}")
+            logger.print(f"PEPPER MLP fallback fair={fair:.1f} err={e}")
 
-        # -- 1. Aggressive BUY: take any ask <= fair + BUY_EDGE ----
-        if od.sell_orders:
+        # ── 1. Aggressive BUY ─────────────────────────────────
+        if od.sell_orders and buy_edge > -900:
             for ask in sorted(od.sell_orders.keys()):
                 if ask <= fair + buy_edge and position < limit:
                     qty = min(-od.sell_orders[ask], limit - position)
                     if qty > 0:
                         orders.append(Order("INTARIAN_PEPPER_ROOT", ask, qty))
-                        position = position + qty
-                        logger.print(f"PEPPER BUY {qty}@{ask} fair={fair:.1f}")
+                        position += qty
+                        logger.print(f"PEPPER BUY {qty}@{ask}")
                 else:
                     break
-        # -- 2. Spike sell: only if bid far above fair, never go short --
+
+        # ── 2. Position-aware spike selling ────────────────────
+        sell_threshold = PEPPER_SELL_SPIKE
+        if position > int(limit * 0.75):
+            sell_threshold = PEPPER_SELL_SPIKE_LOADED
+        elif position > int(limit * 0.5):
+            sell_threshold = PEPPER_SELL_SPIKE_MID
+
         if od.buy_orders and position > 0:
             for bid in sorted(od.buy_orders.keys(), reverse=True):
-                if bid > fair + PEPPER_SELL_SPIKE:
+                if bid > fair + sell_threshold:
                     qty = min(od.buy_orders[bid], position)
                     if qty > 0:
                         orders.append(Order("INTARIAN_PEPPER_ROOT", bid, -qty))
-                        position = position - qty
-                        logger.print(f"PEPPER SPIKE SELL {qty}@{bid} fair={fair:.1f}")
+                        position -= qty
+                        logger.print(f"PEPPER SELL {qty}@{bid} threshold={sell_threshold}")
                 else:
                     break
-        # -- 3. Passive BUY: fill remaining capacity above fair ---
+
+        # ── 3. Passive BUY ────────────────────────────────────
         remaining = limit - position
-        if remaining > 0:
+        if remaining > 0 and buy_edge > -900:
             passive_bid = int(round(fair + PEPPER_PASSIVE_BID_ABOVE))
             if best_ask is not None:
                 passive_bid = min(passive_bid, best_ask - 1)
             orders.append(Order("INTARIAN_PEPPER_ROOT", passive_bid, remaining))
+
         return orders, trader_state
