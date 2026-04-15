@@ -320,210 +320,6 @@ class Logger:
 
 logger = Logger()
 
-# ─────────────────────────────────────────────────────────
-#  1. WALL-MID ESTIMATOR
-#
-#  IMC bots place "wall" orders — deep liquidity at rounded
-#  offsets from the true price. The wall-mid is more accurate
-#  than raw mid, especially for pegged products like Osmium.
-# ─────────────────────────────────────────────────────────
-
-def estimate_wall_mid(od: OrderDepth, fallback_fair: float) -> float:
-
-    if not od.buy_orders or not od.sell_orders:
-        return fallback_fair
-
-    # Find the bid level with max volume
-    bid_wall_price = max(od.buy_orders.keys(), key=lambda p: od.buy_orders[p])
-    bid_wall_vol = od.buy_orders[bid_wall_price]
-
-    # Find the ask level with max volume (volumes are negative in sell_orders)
-    ask_wall_price = min(od.sell_orders.keys(), key=lambda p: od.sell_orders[p])  # most negative = largest
-    ask_wall_vol = abs(od.sell_orders[ask_wall_price])
-
-    # Only trust walls if they have meaningfully more volume than other levels
-    bid_vols = list(od.buy_orders.values())
-    ask_vols = [abs(v) for v in od.sell_orders.values()]
-
-    bid_mean = sum(bid_vols) / len(bid_vols) if bid_vols else 0
-    ask_mean = sum(ask_vols) / len(ask_vols) if ask_vols else 0
-
-    # Wall must be at least 1.5x the average level volume
-    bid_is_wall = bid_wall_vol > bid_mean * 1.5 and len(bid_vols) > 1
-    ask_is_wall = ask_wall_vol > ask_mean * 1.5 and len(ask_vols) > 1
-
-    if bid_is_wall and ask_is_wall:
-        return (bid_wall_price + ask_wall_price) / 2.0
-    elif bid_is_wall:
-        return bid_wall_price + 1.0  # estimate: wall is 1 tick below fair
-    elif ask_is_wall:
-        return ask_wall_price - 1.0
-    else:
-        return fallback_fair
-
-
-# ─────────────────────────────────────────────────────────
-#  2. TAKER BOT DETECTOR
-#
-#  IMC places hidden taker bots that sweep best asks near
-#  the bid. If detected, we post asks just inside the spread
-#  to get hit by the bot for free edge.
-# ─────────────────────────────────────────────────────────
-
-class TakerBotDetector:
-
-    @staticmethod
-    def detect(market_trades: list, od: OrderDepth, trader_state: dict, product: str) -> dict:
-        key = f"taker_bot_{product}"
-        state = trader_state.get(key, {"buy_hits": 0, "sell_hits": 0, "total_ticks": 0})
-        state["total_ticks"] = state.get("total_ticks", 0) + 1
-
-        best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
-        best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
-
-        if market_trades:
-            for trade in market_trades:
-                # A taker buy at best_ask suggests aggressive buyer bot
-                if best_ask is not None and trade.price == best_ask:
-                    state["buy_hits"] = state.get("buy_hits", 0) + 1
-                # A taker sell at best_bid suggests aggressive seller bot
-                if best_bid is not None and trade.price == best_bid:
-                    state["sell_hits"] = state.get("sell_hits", 0) + 1
-
-        ticks = max(state["total_ticks"], 1)
-        state["buy_freq"] = state.get("buy_hits", 0) / ticks
-        state["sell_freq"] = state.get("sell_hits", 0) / ticks
-
-        trader_state[key] = state
-        return state
-
-
-# ─────────────────────────────────────────────────────────
-#  3. REGIME DETECTOR — Bayesian HMM
-#
-#  Two regimes: MEAN_REVERT (0) vs TRENDING (1)
-#  Update posterior each tick from price changes.
-#  Adjusts MM behaviour: tight quotes in MR, wide in trend.
-# ─────────────────────────────────────────────────────────
-
-class RegimeDetector:
-    # Transition probabilities (regimes are sticky)
-    P_STAY_MR = 0.97       # P(MR→MR)
-    P_STAY_TR = 0.93       # P(TR→TR)
-
-    # Observation model: price changes
-    # Mean-revert regime: small changes (σ ~ 2)
-    # Trending regime: larger changes (σ ~ 6)
-    MR_SIGMA = 2.0
-    TR_SIGMA = 6.0
-
-    @staticmethod
-    def _gaussian_pdf(x: float, mu: float, sigma: float) -> float:
-        return math.exp(-0.5 * ((x - mu) / sigma) ** 2) / (sigma * 2.5066)
-
-    @staticmethod
-    def update(price_change: float, trader_state: dict, product: str) -> float:
-
-        key = f"regime_{product}"
-        p_mr = trader_state.get(key, 0.7)  # prior: start assuming MR
-
-        # Predict step (transition)
-        p_mr_pred = p_mr * RegimeDetector.P_STAY_MR + (1 - p_mr) * (1 - RegimeDetector.P_STAY_TR)
-        p_tr_pred = 1 - p_mr_pred
-
-        # Update step (observation likelihood)
-        lik_mr = RegimeDetector._gaussian_pdf(price_change, 0, RegimeDetector.MR_SIGMA)
-        lik_tr = RegimeDetector._gaussian_pdf(price_change, 0, RegimeDetector.TR_SIGMA)
-
-        # Posterior
-        denom = lik_mr * p_mr_pred + lik_tr * p_tr_pred
-        if denom < 1e-15:
-            p_mr_post = 0.5
-        else:
-            p_mr_post = (lik_mr * p_mr_pred) / denom
-
-        # Clamp to avoid numerical extremes
-        p_mr_post = max(0.05, min(0.95, p_mr_post))
-
-        trader_state[key] = p_mr_post
-        return p_mr_post
-
-
-# ─────────────────────────────────────────────────────────
-#  4. UTILITY-OPTIMAL MULTI-LEVEL QUOTER
-#
-#  Instead of one bid/one ask, post 2-3 levels per side.
-#  Each level optimises: E[PnL] = edge × P(fill) - inventory_cost
-#  Wider levels have more edge but lower fill probability.
-# ─────────────────────────────────────────────────────────
-
-class UtilityQuoter:
-    @staticmethod
-    def generate_quotes(
-        fair: float,
-        position: int,
-        limit: int,
-        p_mean_revert: float,
-        spread_half: float = 2.0,
-        n_levels: int = 3,
-        level_step: float = 1.0,
-        inv_penalty: float = 0.3,
-        max_skew: float = 4.0,
-    ) -> tuple:
-
-        # Inventory skew: shift quotes to offload position
-        skew = -position * inv_penalty
-        skew = max(-max_skew, min(max_skew, skew))
-
-        # Regime adjustment: widen spread in trending, tighten in MR
-        regime_mult = 0.7 + 0.6 * (1 - p_mean_revert)  # MR→0.7x, TR→1.3x
-        adj_half = spread_half * regime_mult
-
-        bids = []
-        asks = []
-
-        remaining_bid_qty = limit - position
-        remaining_ask_qty = limit + position
-
-        for level in range(n_levels):
-            offset = adj_half + level * level_step
-
-            # Fill probability decays with distance from fair
-            # (approximate: exponential decay)
-            fill_prob = math.exp(-0.3 * level)
-
-            # Allocate more qty to closer levels (higher fill prob)
-            qty_frac = fill_prob / max(sum(math.exp(-0.3 * i) for i in range(n_levels)), 1e-6)
-
-            bid_px = int(round(fair - offset + skew))
-            ask_px = int(round(fair + offset + skew))
-
-            # Ensure ask > bid always
-            if ask_px <= bid_px:
-                ask_px = bid_px + 1
-
-            bid_qty = max(1, int(remaining_bid_qty * qty_frac))
-            ask_qty = max(1, int(remaining_ask_qty * qty_frac))
-
-            if remaining_bid_qty > 0 and bid_qty > 0:
-                bids.append((bid_px, min(bid_qty, remaining_bid_qty)))
-                remaining_bid_qty -= min(bid_qty, remaining_bid_qty)
-
-            if remaining_ask_qty > 0 and ask_qty > 0:
-                asks.append((ask_px, min(ask_qty, remaining_ask_qty)))
-                remaining_ask_qty -= min(ask_qty, remaining_ask_qty)
-
-        # Dump any remaining qty at the widest level
-        if remaining_bid_qty > 0 and bids:
-            widest_bid = bids[-1][0] - 1
-            bids.append((widest_bid, remaining_bid_qty))
-        if remaining_ask_qty > 0 and asks:
-            widest_ask = asks[-1][0] + 1
-            asks.append((widest_ask, remaining_ask_qty))
-
-        return bids, asks
-
-
 # ═════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═════════════════════════════════════════════════════════════════════
@@ -540,8 +336,6 @@ POSITION_LIMITS = {
 OSMIUM_FAIR         = 10_000
 OSMIUM_MM_HALF      = 1.5    # base half-spread (adjusted by regime)
 OSMIUM_TAKE_EDGE    = 2      # aggressive take threshold
-OSMIUM_N_LEVELS     = 3      # multi-level quoting
-OSMIUM_LEVEL_STEP   = 1.0    # price step between quote levels
 OSMIUM_INV_PENALTY  = 0.3    # inventory skew coefficient
 OSMIUM_MAX_SKEW     = 4
 
@@ -579,10 +373,7 @@ class Trader:
 
             try:
                 if product == "ASH_COATED_OSMIUM":
-                    result[product], trader_state = self.trade_osmium(
-                        od, position, limit, state.timestamp, trader_state,
-                        state.market_trades, state
-                    )
+                    result[product] = self.trade_osmium(od, position, limit)
                 elif product == "INTARIAN_PEPPER_ROOT":
                     result[product], trader_state = self.trade_pepper(
                         od, position, limit, state.timestamp, trader_state,
@@ -600,89 +391,16 @@ class Trader:
         return result, conversions, trader_data
 
     # =============================================================
-    #  ASH_COATED_OSMIUM — Institutional-Grade MM
-    #
-    #  Pipeline:
-    #    1. Wall-mid estimation → true fair value
-    #    2. MLP delta prediction → directional adjustment
-    #    3. Regime detection → spread width adjustment
-    #    4. Taker bot detection → front-running opportunity
-    #    5. Aggressive takes at mispriced levels
-    #    6. Multi-level passive quoting with utility optimization
+    #  ASH_COATED_OSMIUM — Simple Tight MM at 10,000
     # =============================================================
 
-    def trade_osmium(self, od: OrderDepth, position: int, limit: int,
-                     timestamp: int, trader_state: dict, market_trades,
-                     state: TradingState) -> tuple:
+    def trade_osmium(self, od: OrderDepth, position: int, limit: int) -> List[Order]:
         orders: List[Order] = []
+        fair = OSMIUM_FAIR
 
-        # ── STEP 0: Compute best bid/ask ───────────────────────
-        best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
-        best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
-        if best_bid is None and best_ask is None:
-            return orders, trader_state
-
-        raw_mid = (best_bid + best_ask) / 2 if (best_bid and best_ask) else OSMIUM_FAIR
-
-        # ── STEP 1: Wall-mid estimation ────────────────────────
-        wall_mid = estimate_wall_mid(od, OSMIUM_FAIR)
-
-        # ── STEP 2: MLP fair value ────────────────────────────
-        mlp_fair = raw_mid
-        mlp_delta = 0.0
-        mlp_conf = 0.0
-        try:
-            x, mid, trader_state = extract_features(od, market_trades, trader_state, "ASH_COATED_OSMIUM")
-            if mid > 0:
-                delta, confidence, cls, probs = predict_delta("ASH_COATED_OSMIUM", x)
-                mlp_delta = delta
-                mlp_conf = confidence
-                if confidence > 0.25:
-                    mlp_fair = mid + delta
-                else:
-                    mlp_fair = mid
-        except Exception as e:
-            logger.print(f"OSM MLP err: {e}")
-
-        # ── STEP 3: Combine fair values ────────────────────────
-        # Weighted blend: wall_mid is structural, MLP is predictive
-        # Higher MLP confidence → more weight on MLP
-        mlp_weight = min(mlp_conf, 0.6)  # cap MLP influence
-        wall_weight = 1.0 - mlp_weight
-        fair = wall_mid * wall_weight + mlp_fair * mlp_weight
-
-        # ── STEP 4: Regime detection ──────────────────────────
-        prev_mid = trader_state.get("osm_prev_mid", fair)
-        price_change = fair - prev_mid
-        trader_state["osm_prev_mid"] = fair
-
-        p_mr = RegimeDetector.update(price_change, trader_state, "ASH_COATED_OSMIUM")
-
-        # ── STEP 5: Taker bot detection ────────────────────────
-        osm_trades = market_trades.get("ASH_COATED_OSMIUM", [])
-        bot_state = TakerBotDetector.detect(osm_trades, od, trader_state, "ASH_COATED_OSMIUM")
-
-        logger.print(
-            f"OSM t={timestamp} fair={fair:.1f} wall={wall_mid:.1f} mlp={mlp_fair:.1f}"
-            f" d={mlp_delta} conf={mlp_conf:.2f} p_mr={p_mr:.2f}"
-            f" bot_buy={bot_state.get('buy_freq', 0):.2f} pos={position}"
-        )
-
-        # ── STEP 6: Aggressive takes ──────────────────────────
         edge = OSMIUM_TAKE_EDGE
         if abs(position) > int(limit * 0.7):
-            edge += 1  # widen when loaded
-
-        # Taker bot front-run: if bot buys frequently, post asks aggressively
-        if bot_state.get("buy_freq", 0) > 0.3 and best_ask is not None:
-            # Post ask at best_ask - 1 to get hit by taker bot
-            front_run_ask = best_ask - 1
-            if front_run_ask > fair and position > -limit:
-                fr_qty = min(5, limit + position)
-                if fr_qty > 0:
-                    orders.append(Order("ASH_COATED_OSMIUM", front_run_ask, -fr_qty))
-                    position -= fr_qty
-                    logger.print(f"OSM FRONT-RUN ASK {fr_qty}@{front_run_ask}")
+            edge += 1
 
         if od.sell_orders:
             for ask in sorted(od.sell_orders.keys()):
@@ -691,7 +409,6 @@ class Trader:
                     if qty > 0:
                         orders.append(Order("ASH_COATED_OSMIUM", ask, qty))
                         position += qty
-                        logger.print(f"OSM TAKE BUY {qty}@{ask}")
                 else:
                     break
 
@@ -702,33 +419,29 @@ class Trader:
                     if qty > 0:
                         orders.append(Order("ASH_COATED_OSMIUM", bid, -qty))
                         position -= qty
-                        logger.print(f"OSM TAKE SELL {qty}@{bid}")
                 else:
                     break
 
-        # ── STEP 7: Multi-level passive quoting ────────────────
-        bids, asks = UtilityQuoter.generate_quotes(
-            fair=fair,
-            position=position,
-            limit=limit,
-            p_mean_revert=p_mr,
-            spread_half=OSMIUM_MM_HALF,
-            n_levels=OSMIUM_N_LEVELS,
-            level_step=OSMIUM_LEVEL_STEP,
-            inv_penalty=OSMIUM_INV_PENALTY,
-            max_skew=OSMIUM_MAX_SKEW,
-        )
+        skew = -position * OSMIUM_INV_PENALTY
+        skew = max(-OSMIUM_MAX_SKEW, min(OSMIUM_MAX_SKEW, skew))
 
-        for px, qty in bids:
-            if qty > 0:
-                orders.append(Order("ASH_COATED_OSMIUM", px, qty))
-        for px, qty in asks:
-            if qty > 0:
-                orders.append(Order("ASH_COATED_OSMIUM", px, -qty))
+        bid_px = int(round(fair - OSMIUM_MM_HALF + skew))
+        ask_px = int(round(fair + OSMIUM_MM_HALF + skew))
+        bid_px = min(bid_px, int(fair) - 1)
+        ask_px = max(ask_px, int(fair) + 1)
 
-        return orders, trader_state
+        bid_qty = limit - position
+        ask_qty = limit + position
+
+        if bid_qty > 0:
+            orders.append(Order("ASH_COATED_OSMIUM", bid_px, bid_qty))
+        if ask_qty > 0:
+            orders.append(Order("ASH_COATED_OSMIUM", ask_px, -ask_qty))
+
+        return orders
 
     # =============================================================
+    #  INTARIAN_PEPPER_ROOT    # =============================================================
     #  INTARIAN_PEPPER_ROOT — MLP Trend Capture
     #
     #  Pipeline:
