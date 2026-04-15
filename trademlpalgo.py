@@ -412,8 +412,8 @@ class Trader:
         bid_px = min(bid_px, fair - 1)
         ask_px = max(ask_px, fair + 1)
 
-        bid_qty = limit - position
-        ask_qty = limit + position
+        bid_qty = min(limit - position, limit)
+        ask_qty = min(limit + position, limit)
 
         if bid_qty > 0:
             orders.append(Order("ASH_COATED_OSMIUM", bid_px, bid_qty))
