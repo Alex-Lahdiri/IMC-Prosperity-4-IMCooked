@@ -1,4 +1,3 @@
-%%writefile trader.py
 import json
 import math
 from typing import Any, List, Dict
