@@ -1,5 +1,6 @@
 %%writefile trader.py
 import json
+import math
 from typing import Any, List, Dict
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 
@@ -17,15 +18,12 @@ def MLP_dot(a,b):
     return s
 
 def MLP_linear(x, W, b):
-    out = []
-    for Wi, bi in zip(W, b):
-        out.append(MLP_dot(x, Wi) + bi)
-    return out
+    return [MLP_dot(row, x) + bias for row, bias in zip(W, b)]
 
 def MLP_scale(x, mean, scale):
     return [(x - m) / (s if abs(s) > 1e-8 else 1.0) for x, m, s in zip(x, mean, scale)]
 
-def MLP_forward(x, mean, scale, W1, B1, W2, B2, W3, B3, W4, B4):
+def MLP_forward_logits(x, mean, scale, W1, B1, W2, B2, W3, B3, W4, B4):
     x = MLP_scale(x, mean, scale)
     h1 = MLP_relu(MLP_linear(x, W1, B1))
     h2 = MLP_relu(MLP_linear(h1, W2, B2))
@@ -33,6 +31,20 @@ def MLP_forward(x, mean, scale, W1, B1, W2, B2, W3, B3, W4, B4):
     out = MLP_linear(h3, W4, B4)
     return out
 
+def softmax(logits):
+    m = max(logits)
+    exps = [math.exp(x - m) for x in logits]
+    s = sum(exps)
+    return [e / s for e in exps]
+
+def argmax_index(xs):
+    best_i = 0
+    best_v = xs[0]
+    for i in range(1, len(xs)):
+        if xs[i] > best_v:
+            best_v = xs[i]
+            best_i = i
+    return best_i
 FEATURE_ORDER = [
     "bid_price_1", "bid_volume_1",
     "ask_price_1", "ask_volume_1",
@@ -90,10 +102,15 @@ ROOT_B4 = [-0.04770788550376892, -0.12322492897510529, -0.27147677540779114, -0.
 # ONLY USE THESE FUNCTIONS BELOW!!
 # ─────────────────────────────────────────────────────────
 
+# Use like: delta, confidence, class, probabilities = predict_delta_and_confidence(product, x).
+# delta = the predicted price change from mid
+# confidence = the model's confidence in that prediction (0.0 to 1.0)
+# class = the predicted class index (0 to 7)
+# probabilities = the full softmax output for all classes (list of 8 floats)
 
-def predict_delta(product, x):
+def predict_delta(product, x): 
     if product == "ASH_COATED_OSMIUM":
-        return MLP_forward(
+        logits = MLP_forward_logits(
             x,
             OSMIUM_MEAN, OSMIUM_SCALE,
             OSMIUM_W1, OSMIUM_B1,
@@ -101,8 +118,15 @@ def predict_delta(product, x):
             OSMIUM_W3, OSMIUM_B3,
             OSMIUM_W4, OSMIUM_B4,
         )
+        probs = softmax(logits)
+        cls = argmax_index(logits)
+        deltaPrice = OSMIUM_CLASS_VALUES[cls]
+        confidence = probs[cls]
+
+        return deltaPrice, confidence, cls, probs
+
     elif product == "INTARIAN_PEPPER_ROOT":
-        return MLP_forward(
+        logits = MLP_forward_logits(
             x,
             ROOT_MEAN, ROOT_SCALE,
             ROOT_W1, ROOT_B1,
@@ -110,11 +134,17 @@ def predict_delta(product, x):
             ROOT_W3, ROOT_B3,
             ROOT_W4, ROOT_B4,
         )
+        probs = softmax(logits)
+        cls = argmax_index(probs)
+        deltaPrice = ROOT_CLASS_VALUES[cls]
+        confidence = probs[cls]
+        return deltaPrice, confidence, cls, probs
+
     else:
-        return 0.0
+        return 0.0, 0.0, -1, []
 
 def predict_price(product, x, mid_price):
-    return mid_price + predict_delta(product, x)
+    return mid_price + predict_delta(product, x)[0]
 
 def extract_features(od: OrderDepth, market_trades, trader_state, product):
     """
