@@ -286,7 +286,7 @@ class Logger:
 logger = Logger()
 
 # ─────────────────────────────────────────────────────────
-#  CONFIGURATION (v7 — tuned from 8256 baseline)
+#  CONFIGURATION (from 8k algo — proven params)
 # ─────────────────────────────────────────────────────────
 
 POSITION_LIMITS = {
@@ -294,53 +294,41 @@ POSITION_LIMITS = {
     "INTARIAN_PEPPER_ROOT": 80,
 }
 
-# Session length (Prosperity days are 1,000,000 ticks, 10k ticks per timestamp unit)
-SESSION_END_TIMESTAMP = 1_000_000
-EOD_FLUSH_WINDOW       = 50_000   # last 5% of session: start unwinding
-
-OSMIUM_FAIR       = 10_000
-OSMIUM_MM_HALF    = 2           # base half-spread for passive quotes
-OSMIUM_MM_HALF_EOD = 1          # tighten at end-of-day to flush
-OSMIUM_TAKE_EDGE  = 1           # OU κ=0.243 favours tight takes
-
-# Inventory skew — nonlinear so quotes walk away hard when loaded
-OSMIUM_INV_SKEW   = 0.3          # linear coefficient (still used as fallback)
-OSMIUM_MAX_SKEW   = 7            # raised from 4 → let skew bite when near limit
-OSMIUM_SKEW_POWER = 1.5          # nonlinear exponent on |pos|/limit
+OSMIUM_FAIR      = 10_000
+OSMIUM_MM_HALF   = 2          # sweep: 2 > 1 in optimistic (wider quotes = better per-fill edge)
+OSMIUM_TAKE_EDGE = 1          # sweep: 1 best; OU κ=0.243 favours tight takes
+OSMIUM_INV_SKEW  = 0.3
+OSMIUM_MAX_SKEW  = 4
 
 # Imbalance signal — ρ(imb_t, Δmid over 1–100 ticks) ≈ +0.40
-OSMIUM_IMB_BETA   = 1.0
+OSMIUM_IMB_BETA  = 1.0        # sweep: 1-4 all similar; 1.0 slightly best
 
 # Extreme-deviation take (mean-reversion scalp; ρ = -0.35)
-OSMIUM_EXTREME_DEV = 3
+OSMIUM_EXTREME_DEV = 3        # sweep: 3 best; half-life 3 ticks → catch small dislocations
 
-# Laddered passive quotes — v7: more size on tight (better edge per fill at fair anchor)
-OSMIUM_LADDER_OFFSET = 4
-OSMIUM_LADDER_SPLIT  = 0.6       # flipped from 0.4 → 60% on tight level
+# Laddered passive quotes
+OSMIUM_LADDER_OFFSET = 4      # sweep: 4 best (from 2); wider secondary level captures more
+OSMIUM_LADDER_SPLIT  = 0.4    # sweep: 0.4 best (from 0.6); put more size on the wider level
 
-# Aggressive inventory unwind
-OSMIUM_UNWIND_THRESHOLD     = 40
-OSMIUM_UNWIND_THRESHOLD_EOD = 20  # lower threshold in EOD window
-OSMIUM_UNWIND_SACRIFICE     = 2
-OSMIUM_UNWIND_SACRIFICE_EOD = 4   # accept worse fills near session close
-OSMIUM_UNWIND_FRACTION      = 0.5
-OSMIUM_UNWIND_FRACTION_EOD  = 1.0 # flush aggressively at EOD
+# Aggressive inventory unwind — risk management when deep inventory accumulates
+OSMIUM_UNWIND_THRESHOLD   = 40   # fires when |position| exceeds this
+OSMIUM_UNWIND_SACRIFICE   = 2    # willing to trade within this tick of fair (below for sells)
+OSMIUM_UNWIND_FRACTION    = 0.5  # reduce excess inventory by this fraction per tick
 
-# OU mean-reversion scalp
-OSMIUM_OU_SCALP_ENABLED    = True
-OSMIUM_OU_SCALP_SPREAD_MAX = 8
-OSMIUM_OU_SCALP_DEV        = 2
-OSMIUM_OU_SCALP_MAX_LOSS   = 2
-OSMIUM_OU_SCALP_SIZE       = 20
+# Aggressive OU mean-reversion scalp — bets on κ=0.243 half-life of 3 ticks
+# Backtest says this loses ~350/3-days due to wide-spread cost eating the edge,
+# but live behaviour may differ if spread tightens more often than historical data shows.
+OSMIUM_OU_SCALP_ENABLED   = True
+OSMIUM_OU_SCALP_SPREAD_MAX = 8   # only fire when spread ≤ this
+OSMIUM_OU_SCALP_DEV        = 2   # mid must deviate from fair by at least this
+OSMIUM_OU_SCALP_MAX_LOSS   = 2   # willing to trade at fair ± this
+OSMIUM_OU_SCALP_SIZE       = 20  # max units per trigger
 
-# Pepper Root — deterministic uptrend, max-long strategy
 PEPPER_SLOPE              = 1.0 / 1000
-PEPPER_BUY_EDGE           = 6   # v7: 8→6. Faster ramp to max pos captures more trend PnL
-PEPPER_SELL_SPIKE         = 8
-PEPPER_PASSIVE_BID_OFFSET = 1   # v7: 2→1. Less overpay when knocked off max
+PEPPER_BUY_EDGE           = 8   # sweep: 8 best — 1.5K ticks to max pos vs 18.7K at 6
+PEPPER_SELL_SPIKE         = 8   # sweep: 8 best; selectivity beats sensitivity
+PEPPER_PASSIVE_BID_OFFSET = 1   # v7.1: 2→1. Less overpay when knocked off max
 PEPPER_INTERCEPT_EWMA     = 0.0005
-PEPPER_INTERCEPT_SANITY   = 200 # re-bootstrap if drift exceeds this
-PEPPER_MLP_CONFIDENCE     = 0.35 # v7: 0.3→0.35, slightly stricter
 
 
 # ─────────────────────────────────────────────────────────
@@ -365,7 +353,7 @@ class Trader:
 
             try:
                 if product == "ASH_COATED_OSMIUM":
-                    result[product] = self.trade_osmium(od, position, limit, state.timestamp)
+                    result[product] = self.trade_osmium(od, position, limit)
                 elif product == "INTARIAN_PEPPER_ROOT":
                     result[product], trader_state = self.trade_pepper(
                         od, position, limit, state.timestamp, trader_state,
@@ -384,8 +372,7 @@ class Trader:
     #  ASH_COATED_OSMIUM — Tight MM at 10,000 (8k algo, unchanged)
     # =============================================================
 
-    def trade_osmium(self, od: OrderDepth, position: int, limit: int,
-                     timestamp: int) -> List[Order]:
+    def trade_osmium(self, od: OrderDepth, position: int, limit: int) -> List[Order]:
         orders: List[Order] = []
         fair = OSMIUM_FAIR
 
@@ -394,18 +381,8 @@ class Trader:
         if best_bid is None and best_ask is None:
             return orders
 
-        # v7: use is-not-None checks so a legitimate 0 wouldn't break things
-        if best_bid is not None and best_ask is not None:
-            mid = (best_bid + best_ask) / 2
-        else:
-            mid = float(best_bid if best_bid is not None else best_ask)
-
-        # ── End-of-day regime ─────────────────────────────────────
-        eod = (SESSION_END_TIMESTAMP - timestamp) <= EOD_FLUSH_WINDOW
-        mm_half           = OSMIUM_MM_HALF_EOD       if eod else OSMIUM_MM_HALF
-        unwind_threshold  = OSMIUM_UNWIND_THRESHOLD_EOD if eod else OSMIUM_UNWIND_THRESHOLD
-        unwind_sacrifice  = OSMIUM_UNWIND_SACRIFICE_EOD if eod else OSMIUM_UNWIND_SACRIFICE
-        unwind_fraction   = OSMIUM_UNWIND_FRACTION_EOD  if eod else OSMIUM_UNWIND_FRACTION
+        mid = (best_bid + best_ask) / 2 if (best_bid is not None and best_ask is not None) \
+              else float(best_bid if best_bid is not None else best_ask)
 
         # ── Imbalance signal (ρ ≈ +0.40 with future Δmid) ─────────
         bid_vol_total = sum(od.buy_orders.values()) if od.buy_orders else 0
@@ -414,6 +391,8 @@ class Trader:
         imbalance = (bid_vol_total - ask_vol_total) / total_vol if total_vol > 0 else 0.0
 
         # ── Extreme-deviation regime: stretch the take net ───────
+        # When mid is far from fair, OU κ=0.243 says next tick reverts.
+        # Drop TAKE_EDGE effectively to zero so we hit bids above fair / lift asks below fair.
         dev = mid - fair
         effective_take_edge = 0 if abs(dev) > OSMIUM_EXTREME_DEV else OSMIUM_TAKE_EDGE
 
@@ -435,94 +414,75 @@ class Trader:
                         orders.append(Order("ASH_COATED_OSMIUM", bid, -qty))
                         position -= qty
 
-        # ── 2b. Consolidated unwind + OU scalp ────────────────────
-        # v7: merged the two loops that previously walked the book
-        # separately. One pass per side, using the stricter of the two
-        # sacrifice thresholds so logic stays consistent.
-        #
-        # Sell-side triggers when we're too long OR mid is elevated.
-        # Buy-side triggers when we're too short OR mid is depressed.
-
-        spread_now = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else 99
-        ou_scalp_active = OSMIUM_OU_SCALP_ENABLED and spread_now <= OSMIUM_OU_SCALP_SPREAD_MAX
-
-        # Sell-side (reduce long OR scalp high mid)
-        want_unwind_long = position > unwind_threshold
-        want_scalp_sell  = ou_scalp_active and dev > OSMIUM_OU_SCALP_DEV
-
-        if (want_unwind_long or want_scalp_sell) and od.buy_orders:
-            target = 0
-            if want_unwind_long:
-                target = max(target, int((position - unwind_threshold) * unwind_fraction))
-            if want_scalp_sell:
-                target = max(target, OSMIUM_OU_SCALP_SIZE)
-
-            # Use the more lenient of the two sacrifice floors
-            floor_price = fair - max(
-                unwind_sacrifice if want_unwind_long else 0,
-                OSMIUM_OU_SCALP_MAX_LOSS if want_scalp_sell else 0,
-            )
-
+        # ── 2b. Inventory unwind: walk the book when inventory is extreme ─
+        # Accept worse per-unit edge (down to fair − SACRIFICE) to free capacity.
+        # Skips price levels already covered by step 1/2 to avoid double-booking.
+        if position > OSMIUM_UNWIND_THRESHOLD and od.buy_orders:
+            target = int((position - OSMIUM_UNWIND_THRESHOLD) * OSMIUM_UNWIND_FRACTION)
             for bid_px in sorted(od.buy_orders.keys(), reverse=True):
-                if target <= 0:
-                    break
-                if bid_px < floor_price:
-                    break
-                if bid_px > fair + effective_take_edge:
-                    continue  # already hit in step 2
+                if target <= 0: break
+                if bid_px < fair - OSMIUM_UNWIND_SACRIFICE: break  # too cheap
+                if bid_px > fair + effective_take_edge: continue   # already taken in 2
                 qty = min(od.buy_orders[bid_px], target, limit + position)
                 if qty > 0:
                     orders.append(Order("ASH_COATED_OSMIUM", bid_px, -qty))
                     position -= qty
-                    target  -= qty
+                    target -= qty
 
-        # Buy-side (reduce short OR scalp low mid)
-        want_unwind_short = position < -unwind_threshold
-        want_scalp_buy    = ou_scalp_active and dev < -OSMIUM_OU_SCALP_DEV
-
-        if (want_unwind_short or want_scalp_buy) and od.sell_orders:
-            target = 0
-            if want_unwind_short:
-                target = max(target, int((-position - unwind_threshold) * unwind_fraction))
-            if want_scalp_buy:
-                target = max(target, OSMIUM_OU_SCALP_SIZE)
-
-            ceil_price = fair + max(
-                unwind_sacrifice if want_unwind_short else 0,
-                OSMIUM_OU_SCALP_MAX_LOSS if want_scalp_buy else 0,
-            )
-
+        elif position < -OSMIUM_UNWIND_THRESHOLD and od.sell_orders:
+            target = int((-position - OSMIUM_UNWIND_THRESHOLD) * OSMIUM_UNWIND_FRACTION)
             for ask_px in sorted(od.sell_orders.keys()):
-                if target <= 0:
-                    break
-                if ask_px > ceil_price:
-                    break
-                if ask_px < fair - effective_take_edge:
-                    continue
+                if target <= 0: break
+                if ask_px > fair + OSMIUM_UNWIND_SACRIFICE: break   # too expensive
+                if ask_px < fair - effective_take_edge: continue    # already taken in 1
                 qty = min(-od.sell_orders[ask_px], target, limit - position)
                 if qty > 0:
                     orders.append(Order("ASH_COATED_OSMIUM", ask_px, qty))
                     position += qty
-                    target   -= qty
+                    target -= qty
 
-        # ── 3. Passive MM with nonlinear inventory skew ──────────
-        # v7: skew now scales as (|pos|/limit)^1.5 so it's mild when flat
-        # but bites hard when near the limit. Caps at OSMIUM_MAX_SKEW.
-        if limit > 0:
-            inv_ratio = abs(position) / limit
-            inv_skew_mag = (inv_ratio ** OSMIUM_SKEW_POWER) * OSMIUM_MAX_SKEW
-            inv_skew = -inv_skew_mag if position > 0 else inv_skew_mag
-        else:
-            inv_skew = 0.0
+        # ── 2c. Aggressive OU scalp: bet on mean reversion when spread is tight ─
+        # OU half-life is 3 ticks; Δmid σ ≈ 3.5. When spread is narrow enough that
+        # we can trade within OU_SCALP_MAX_LOSS of fair, the expected mean reversion
+        # should pay for the half-spread cost.
+        if (OSMIUM_OU_SCALP_ENABLED and best_bid is not None and best_ask is not None):
+            spread_now = best_ask - best_bid
+            if spread_now <= OSMIUM_OU_SCALP_SPREAD_MAX:
+                if dev > OSMIUM_OU_SCALP_DEV:
+                    # Mid is high — expect it to fall. Sell into bids near fair.
+                    remaining = OSMIUM_OU_SCALP_SIZE
+                    for bid_px in sorted(od.buy_orders.keys(), reverse=True):
+                        if remaining <= 0: break
+                        if bid_px < fair - OSMIUM_OU_SCALP_MAX_LOSS: break
+                        if bid_px > fair + effective_take_edge: continue  # already taken
+                        qty = min(od.buy_orders[bid_px], remaining, limit + position)
+                        if qty > 0:
+                            orders.append(Order("ASH_COATED_OSMIUM", bid_px, -qty))
+                            position -= qty
+                            remaining -= qty
+                elif dev < -OSMIUM_OU_SCALP_DEV:
+                    # Mid is low — expect it to rise. Buy from asks near fair.
+                    remaining = OSMIUM_OU_SCALP_SIZE
+                    for ask_px in sorted(od.sell_orders.keys()):
+                        if remaining <= 0: break
+                        if ask_px > fair + OSMIUM_OU_SCALP_MAX_LOSS: break
+                        if ask_px < fair - effective_take_edge: continue  # already taken
+                        qty = min(-od.sell_orders[ask_px], remaining, limit - position)
+                        if qty > 0:
+                            orders.append(Order("ASH_COATED_OSMIUM", ask_px, qty))
+                            position += qty
+                            remaining -= qty
 
-        signal_skew = OSMIUM_IMB_BETA * imbalance
+        # ── 3. Passive MM with inventory + imbalance skew ────────
+        inv_skew    = -position * OSMIUM_INV_SKEW
+        signal_skew = OSMIUM_IMB_BETA * imbalance         # imb>0 (buy pressure) → lift quotes
         skew = inv_skew + signal_skew
         skew = max(-OSMIUM_MAX_SKEW, min(OSMIUM_MAX_SKEW, skew))
 
         # Tight level
-        bid_px_1 = int(round(fair - mm_half + skew))
-        ask_px_1 = int(round(fair + mm_half + skew))
-        bid_px_1 = min(bid_px_1, fair - 1)
+        bid_px_1 = int(round(fair - OSMIUM_MM_HALF + skew))
+        ask_px_1 = int(round(fair + OSMIUM_MM_HALF + skew))
+        bid_px_1 = min(bid_px_1, fair - 1)   # never cross fair
         ask_px_1 = max(ask_px_1, fair + 1)
 
         # Wider ladder level
@@ -532,7 +492,7 @@ class Trader:
         bid_budget = limit - position
         ask_budget = limit + position
 
-        # v7: 0.6 on tight level, 0.4 on wide (flipped from previous)
+        # Split budget between tight and wide; tight gets the majority
         if bid_budget > 0:
             bid_qty_1 = int(round(bid_budget * OSMIUM_LADDER_SPLIT))
             bid_qty_2 = bid_budget - bid_qty_1
@@ -568,30 +528,18 @@ class Trader:
         if best_bid is None and best_ask is None:
             return orders, trader_state
 
-        # v7: consistent is-not-None checks
-        if best_bid is not None and best_ask is not None:
-            mid = (best_bid + best_ask) / 2
-        else:
-            mid = float(best_bid if best_bid is not None else best_ask)
+        mid = (best_bid + best_ask) / 2 if (best_bid is not None and best_ask is not None) else float(best_bid if best_bid is not None else best_ask)
 
         # ── Bootstrap linear trend intercept ─────────────────────
         pepper_key = "pepper_intercept"
-        expected_intercept = mid - timestamp * PEPPER_SLOPE
-
         if pepper_key not in trader_state:
-            trader_state[pepper_key] = expected_intercept
-        else:
-            # v7: sanity-check drift. If the stored intercept has drifted
-            # more than PEPPER_INTERCEPT_SANITY from what the current mid
-            # implies, re-bootstrap. Protects against stale state from a
-            # silent JSON round-trip failure.
-            if abs(trader_state[pepper_key] - expected_intercept) > PEPPER_INTERCEPT_SANITY:
-                trader_state[pepper_key] = expected_intercept
+            trader_state[pepper_key] = mid - timestamp * PEPPER_SLOPE
 
         intercept = trader_state[pepper_key]
         trend_fair = intercept + timestamp * PEPPER_SLOPE
 
-        # Slow regime-shift watchdog
+        # Slow regime-shift watchdog: EWMA effective window ~2000 ticks
+        # (was 0.005 → 200 ticks, which was dragging fair toward stale mids)
         residual = mid - trend_fair
         trader_state[pepper_key] = intercept + PEPPER_INTERCEPT_EWMA * residual
 
@@ -601,12 +549,11 @@ class Trader:
             x, mlp_mid, trader_state = extract_features(od, market_trades, trader_state, "INTARIAN_PEPPER_ROOT")
             if mlp_mid > 0:
                 delta, confidence, cls, probs = predict_delta("INTARIAN_PEPPER_ROOT", x)
-                if confidence > PEPPER_MLP_CONFIDENCE:
-                    fair = trend_fair + delta * 0.5
+                # Blend MLP into fair — small nudge, never dominates
+                if confidence > 0.3:
+                    fair = trend_fair + delta * 0.5  # half-weight the MLP shift
         except Exception as e:
-            # v7: suppress per-tick spam, just log type
-            err_count_key = "pepper_mlp_errors"
-            trader_state[err_count_key] = trader_state.get(err_count_key, 0) + 1
+            logger.print(f"PEPPER MLP skipped: {type(e).__name__}: {e}")
 
         logger.print(f"PEPPER t={timestamp} fair={fair:.1f} trend={trend_fair:.1f} mid={mid:.1f} pos={position}")
 
