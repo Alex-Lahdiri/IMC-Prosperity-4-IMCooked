@@ -295,26 +295,26 @@ POSITION_LIMITS = {
 }
 
 OSMIUM_FAIR      = 10_000
-OSMIUM_MM_HALF   = 1          # was 2 — quote inside the modal 16-wide book for queue priority
-OSMIUM_TAKE_EDGE = 3
+OSMIUM_MM_HALF   = 1          # quote inside the modal 16-wide book
+OSMIUM_TAKE_EDGE = 1          # sweep: 1 best (from 3); OU κ=0.243 favours tight takes
 OSMIUM_INV_SKEW  = 0.3
 OSMIUM_MAX_SKEW  = 4
 
-# New — imbalance signal (analysis: ρ(imb_t, Δmid over 1–100 ticks) ≈ +0.40)
-OSMIUM_IMB_BETA  = 2.0        # skew quotes by β · imbalance, imb ∈ [-1, +1]
+# Imbalance signal — ρ(imb_t, Δmid over 1–100 ticks) ≈ +0.40
+OSMIUM_IMB_BETA  = 2.0
 
-# New — extreme-deviation take (mid far from μ: mean-reversion scalp; analysis: ρ = -0.35)
-OSMIUM_EXTREME_DEV = 5        # if |mid − fair| > 5, take anything beyond fair (not just > fair+3)
+# Extreme-deviation take (mean-reversion scalp; ρ = -0.35)
+OSMIUM_EXTREME_DEV = 3        # sweep: 3 best (from 5); half-life 3 ticks → catch small dislocations
 
-# New — laddered passive quotes (post a second, wider level for extra fills)
-OSMIUM_LADDER_OFFSET = 2      # second level sits MM_HALF + this ticks out
-OSMIUM_LADDER_SPLIT  = 0.6    # fraction of remaining size at the tight level
+# Laddered passive quotes
+OSMIUM_LADDER_OFFSET = 2
+OSMIUM_LADDER_SPLIT  = 0.6
 
 PEPPER_SLOPE              = 1.0 / 1000
-PEPPER_BUY_EDGE           = 4   # was 8 — ~2σ of residuals; still easily crossed
-PEPPER_SELL_SPIKE         = 6   # was 50 (never fired); just above 95% residual band
+PEPPER_BUY_EDGE           = 6   # sweep: 6 best (from 4); drift rewards early/aggressive entries
+PEPPER_SELL_SPIKE         = 8   # sweep: 8 best (from 6); selectivity beats sensitivity
 PEPPER_PASSIVE_BID_OFFSET = 2
-PEPPER_INTERCEPT_EWMA     = 0.0005   # was 0.005 — slow drift; regime-shift watchdog, not tracker
+PEPPER_INTERCEPT_EWMA     = 0.0005
 
 
 # ─────────────────────────────────────────────────────────
