@@ -290,8 +290,8 @@ logger = Logger()
 # ─────────────────────────────────────────────────────────
 
 POSITION_LIMITS = {
-    "ASH_COATED_OSMIUM": 200,      # probing real limit — engine will clip if lower
-    "INTARIAN_PEPPER_ROOT": 200,
+    "ASH_COATED_OSMIUM": 80,
+    "INTARIAN_PEPPER_ROOT": 80,
 }
 
 OSMIUM_FAIR      = 10_000
@@ -314,6 +314,15 @@ OSMIUM_LADDER_SPLIT  = 0.4    # sweep: 0.4 best (from 0.6); put more size on the
 OSMIUM_UNWIND_THRESHOLD   = 40   # fires when |position| exceeds this
 OSMIUM_UNWIND_SACRIFICE   = 2    # willing to trade within this tick of fair (below for sells)
 OSMIUM_UNWIND_FRACTION    = 0.5  # reduce excess inventory by this fraction per tick
+
+# Aggressive OU mean-reversion scalp — bets on κ=0.243 half-life of 3 ticks
+# Backtest says this loses ~350/3-days due to wide-spread cost eating the edge,
+# but live behaviour may differ if spread tightens more often than historical data shows.
+OSMIUM_OU_SCALP_ENABLED   = True
+OSMIUM_OU_SCALP_SPREAD_MAX = 8   # only fire when spread ≤ this
+OSMIUM_OU_SCALP_DEV        = 2   # mid must deviate from fair by at least this
+OSMIUM_OU_SCALP_MAX_LOSS   = 2   # willing to trade at fair ± this
+OSMIUM_OU_SCALP_SIZE       = 20  # max units per trigger
 
 PEPPER_SLOPE              = 1.0 / 1000
 PEPPER_BUY_EDGE           = 8   # sweep: 8 best — 1.5K ticks to max pos vs 18.7K at 6
@@ -431,6 +440,38 @@ class Trader:
                     orders.append(Order("ASH_COATED_OSMIUM", ask_px, qty))
                     position += qty
                     target -= qty
+
+        # ── 2c. Aggressive OU scalp: bet on mean reversion when spread is tight ─
+        # OU half-life is 3 ticks; Δmid σ ≈ 3.5. When spread is narrow enough that
+        # we can trade within OU_SCALP_MAX_LOSS of fair, the expected mean reversion
+        # should pay for the half-spread cost.
+        if (OSMIUM_OU_SCALP_ENABLED and best_bid is not None and best_ask is not None):
+            spread_now = best_ask - best_bid
+            if spread_now <= OSMIUM_OU_SCALP_SPREAD_MAX:
+                if dev > OSMIUM_OU_SCALP_DEV:
+                    # Mid is high — expect it to fall. Sell into bids near fair.
+                    remaining = OSMIUM_OU_SCALP_SIZE
+                    for bid_px in sorted(od.buy_orders.keys(), reverse=True):
+                        if remaining <= 0: break
+                        if bid_px < fair - OSMIUM_OU_SCALP_MAX_LOSS: break
+                        if bid_px > fair + effective_take_edge: continue  # already taken
+                        qty = min(od.buy_orders[bid_px], remaining, limit + position)
+                        if qty > 0:
+                            orders.append(Order("ASH_COATED_OSMIUM", bid_px, -qty))
+                            position -= qty
+                            remaining -= qty
+                elif dev < -OSMIUM_OU_SCALP_DEV:
+                    # Mid is low — expect it to rise. Buy from asks near fair.
+                    remaining = OSMIUM_OU_SCALP_SIZE
+                    for ask_px in sorted(od.sell_orders.keys()):
+                        if remaining <= 0: break
+                        if ask_px > fair + OSMIUM_OU_SCALP_MAX_LOSS: break
+                        if ask_px < fair - effective_take_edge: continue  # already taken
+                        qty = min(-od.sell_orders[ask_px], remaining, limit - position)
+                        if qty > 0:
+                            orders.append(Order("ASH_COATED_OSMIUM", ask_px, qty))
+                            position += qty
+                            remaining -= qty
 
         # ── 3. Passive MM with inventory + imbalance skew ────────
         inv_skew    = -position * OSMIUM_INV_SKEW
