@@ -295,20 +295,20 @@ POSITION_LIMITS = {
 }
 
 OSMIUM_FAIR      = 10_000
-OSMIUM_MM_HALF   = 1          # quote inside the modal 16-wide book
-OSMIUM_TAKE_EDGE = 1          # sweep: 1 best (from 3); OU κ=0.243 favours tight takes
+OSMIUM_MM_HALF   = 2          # sweep: 2 > 1 in optimistic (wider quotes = better per-fill edge)
+OSMIUM_TAKE_EDGE = 1          # sweep: 1 best; OU κ=0.243 favours tight takes
 OSMIUM_INV_SKEW  = 0.3
 OSMIUM_MAX_SKEW  = 4
 
 # Imbalance signal — ρ(imb_t, Δmid over 1–100 ticks) ≈ +0.40
-OSMIUM_IMB_BETA  = 2.0
+OSMIUM_IMB_BETA  = 1.0        # sweep: 1-4 all similar; 1.0 slightly best
 
 # Extreme-deviation take (mean-reversion scalp; ρ = -0.35)
-OSMIUM_EXTREME_DEV = 3        # sweep: 3 best (from 5); half-life 3 ticks → catch small dislocations
+OSMIUM_EXTREME_DEV = 3        # sweep: 3 best; half-life 3 ticks → catch small dislocations
 
 # Laddered passive quotes
-OSMIUM_LADDER_OFFSET = 2
-OSMIUM_LADDER_SPLIT  = 0.6
+OSMIUM_LADDER_OFFSET = 4      # sweep: 4 best (from 2); wider secondary level captures more
+OSMIUM_LADDER_SPLIT  = 0.4    # sweep: 0.4 best (from 0.6); put more size on the wider level
 
 PEPPER_SLOPE              = 1.0 / 1000
 PEPPER_BUY_EDGE           = 8   # sweep: 8 best — 1.5K ticks to max pos vs 18.7K at 6
