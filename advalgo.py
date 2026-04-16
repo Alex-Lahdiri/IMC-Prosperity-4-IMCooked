@@ -290,8 +290,8 @@ logger = Logger()
 # ─────────────────────────────────────────────────────────
 
 POSITION_LIMITS = {
-    "ASH_COATED_OSMIUM": 80,
-    "INTARIAN_PEPPER_ROOT": 80,
+    "ASH_COATED_OSMIUM": 200,      # probing real limit — engine will clip if lower
+    "INTARIAN_PEPPER_ROOT": 200,
 }
 
 OSMIUM_FAIR      = 10_000
