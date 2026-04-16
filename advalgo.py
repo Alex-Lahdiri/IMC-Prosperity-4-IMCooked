@@ -311,8 +311,8 @@ OSMIUM_LADDER_OFFSET = 2
 OSMIUM_LADDER_SPLIT  = 0.6
 
 PEPPER_SLOPE              = 1.0 / 1000
-PEPPER_BUY_EDGE           = 6   # sweep: 6 best (from 4); drift rewards early/aggressive entries
-PEPPER_SELL_SPIKE         = 8   # sweep: 8 best (from 6); selectivity beats sensitivity
+PEPPER_BUY_EDGE           = 8   # sweep: 8 best — 1.5K ticks to max pos vs 18.7K at 6
+PEPPER_SELL_SPIKE         = 8   # sweep: 8 best; selectivity beats sensitivity
 PEPPER_PASSIVE_BID_OFFSET = 2
 PEPPER_INTERCEPT_EWMA     = 0.0005
 
