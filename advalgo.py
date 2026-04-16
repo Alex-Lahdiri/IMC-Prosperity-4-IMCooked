@@ -310,6 +310,11 @@ OSMIUM_EXTREME_DEV = 3        # sweep: 3 best; half-life 3 ticks → catch small
 OSMIUM_LADDER_OFFSET = 4      # sweep: 4 best (from 2); wider secondary level captures more
 OSMIUM_LADDER_SPLIT  = 0.4    # sweep: 0.4 best (from 0.6); put more size on the wider level
 
+# Aggressive inventory unwind — risk management when deep inventory accumulates
+OSMIUM_UNWIND_THRESHOLD   = 40   # fires when |position| exceeds this
+OSMIUM_UNWIND_SACRIFICE   = 2    # willing to trade within this tick of fair (below for sells)
+OSMIUM_UNWIND_FRACTION    = 0.5  # reduce excess inventory by this fraction per tick
+
 PEPPER_SLOPE              = 1.0 / 1000
 PEPPER_BUY_EDGE           = 8   # sweep: 8 best — 1.5K ticks to max pos vs 18.7K at 6
 PEPPER_SELL_SPIKE         = 8   # sweep: 8 best; selectivity beats sensitivity
@@ -399,6 +404,33 @@ class Trader:
                     if qty > 0:
                         orders.append(Order("ASH_COATED_OSMIUM", bid, -qty))
                         position -= qty
+
+        # ── 2b. Inventory unwind: walk the book when inventory is extreme ─
+        # Accept worse per-unit edge (down to fair − SACRIFICE) to free capacity.
+        # Skips price levels already covered by step 1/2 to avoid double-booking.
+        if position > OSMIUM_UNWIND_THRESHOLD and od.buy_orders:
+            target = int((position - OSMIUM_UNWIND_THRESHOLD) * OSMIUM_UNWIND_FRACTION)
+            for bid_px in sorted(od.buy_orders.keys(), reverse=True):
+                if target <= 0: break
+                if bid_px < fair - OSMIUM_UNWIND_SACRIFICE: break  # too cheap
+                if bid_px > fair + effective_take_edge: continue   # already taken in 2
+                qty = min(od.buy_orders[bid_px], target, limit + position)
+                if qty > 0:
+                    orders.append(Order("ASH_COATED_OSMIUM", bid_px, -qty))
+                    position -= qty
+                    target -= qty
+
+        elif position < -OSMIUM_UNWIND_THRESHOLD and od.sell_orders:
+            target = int((-position - OSMIUM_UNWIND_THRESHOLD) * OSMIUM_UNWIND_FRACTION)
+            for ask_px in sorted(od.sell_orders.keys()):
+                if target <= 0: break
+                if ask_px > fair + OSMIUM_UNWIND_SACRIFICE: break   # too expensive
+                if ask_px < fair - effective_take_edge: continue    # already taken in 1
+                qty = min(-od.sell_orders[ask_px], target, limit - position)
+                if qty > 0:
+                    orders.append(Order("ASH_COATED_OSMIUM", ask_px, qty))
+                    position += qty
+                    target -= qty
 
         # ── 3. Passive MM with inventory + imbalance skew ────────
         inv_skew    = -position * OSMIUM_INV_SKEW
