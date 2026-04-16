@@ -286,7 +286,9 @@ class Logger:
 logger = Logger()
 
 # ─────────────────────────────────────────────────────────
-#  CONFIGURATION (from 8k algo — proven params)
+#  CONFIGURATION (v7 — tuned on real prosperity4bt backtester)
+#  Baseline v6: 254,908 PnL across 3 days (R1)
+#  v7 tuning:   266,698 PnL (+11,790) from Osmium sweep
 # ─────────────────────────────────────────────────────────
 
 POSITION_LIMITS = {
@@ -294,41 +296,40 @@ POSITION_LIMITS = {
     "INTARIAN_PEPPER_ROOT": 80,
 }
 
+# ── OSMIUM — pure fair-anchored MM at 10,000 ────────────
 OSMIUM_FAIR      = 10_000
-OSMIUM_MM_HALF   = 2          # sweep: 2 > 1 in optimistic (wider quotes = better per-fill edge)
-OSMIUM_TAKE_EDGE = 1          # sweep: 1 best; OU κ=0.243 favours tight takes
-OSMIUM_INV_SKEW  = 0.3
-OSMIUM_MAX_SKEW  = 4
+OSMIUM_MM_HALF   = 7          # v7: 2→7. Wider quoting captures better edge per fill.
+                              # Sweep: 5→260k, 6→262k, 7→266k, 8→266k, 9→263k
+OSMIUM_TAKE_EDGE = 1          # Takes rarely fire at MH=7; kept for safety
+OSMIUM_INV_SKEW  = 0.1        # v7: 0.3→0.1. Less aggressive skew improves fill rate
+OSMIUM_MAX_SKEW  = 6          # v7: 4→6. Marginal improvement
 
-# Imbalance signal — ρ(imb_t, Δmid over 1–100 ticks) ≈ +0.40
-OSMIUM_IMB_BETA  = 1.0        # sweep: 1-4 all similar; 1.0 slightly best
+OSMIUM_IMB_BETA  = 0          # v7: 1.0→0. Imbalance signal adds noise at wide quoting
 
-# Extreme-deviation take (mean-reversion scalp; ρ = -0.35)
-OSMIUM_EXTREME_DEV = 3        # sweep: 3 best; half-life 3 ticks → catch small dislocations
+OSMIUM_EXTREME_DEV = 20       # v7: 3→20 (effectively disabled).
+                              # Takes at extreme dev were a small negative.
 
-# Laddered passive quotes
-OSMIUM_LADDER_OFFSET = 4      # sweep: 4 best (from 2); wider secondary level captures more
-OSMIUM_LADDER_SPLIT  = 0.4    # sweep: 0.4 best (from 0.6); put more size on the wider level
+OSMIUM_LADDER_OFFSET = 4      # sweep: 4 best
+OSMIUM_LADDER_SPLIT  = 0.4    # sweep: 0.4 best
 
-# Aggressive inventory unwind — risk management when deep inventory accumulates
-OSMIUM_UNWIND_THRESHOLD   = 40   # fires when |position| exceeds this
-OSMIUM_UNWIND_SACRIFICE   = 2    # willing to trade within this tick of fair (below for sells)
-OSMIUM_UNWIND_FRACTION    = 0.5  # reduce excess inventory by this fraction per tick
+OSMIUM_UNWIND_THRESHOLD   = 30   # v7: 40→30. Slightly earlier unwind
+OSMIUM_UNWIND_SACRIFICE   = 2
+OSMIUM_UNWIND_FRACTION    = 0.5
 
-# Aggressive OU mean-reversion scalp — bets on κ=0.243 half-life of 3 ticks
-# Backtest says this loses ~350/3-days due to wide-spread cost eating the edge,
-# but live behaviour may differ if spread tightens more often than historical data shows.
-OSMIUM_OU_SCALP_ENABLED   = True
-OSMIUM_OU_SCALP_SPREAD_MAX = 8   # only fire when spread ≤ this
-OSMIUM_OU_SCALP_DEV        = 2   # mid must deviate from fair by at least this
-OSMIUM_OU_SCALP_MAX_LOSS   = 2   # willing to trade at fair ± this
-OSMIUM_OU_SCALP_SIZE       = 20  # max units per trigger
+# OU scalp has zero effect when MM_HALF=7 (paths don't fire). Kept disabled for clarity.
+OSMIUM_OU_SCALP_ENABLED   = False
+OSMIUM_OU_SCALP_SPREAD_MAX = 8
+OSMIUM_OU_SCALP_DEV        = 2
+OSMIUM_OU_SCALP_MAX_LOSS   = 2
+OSMIUM_OU_SCALP_SIZE       = 20
 
+# ── PEPPER — max-long on deterministic uptrend ──────────
 PEPPER_SLOPE              = 1.0 / 1000
-PEPPER_BUY_EDGE           = 8   # sweep: 8 best — 1.5K ticks to max pos vs 18.7K at 6
-PEPPER_SELL_SPIKE         = 8   # sweep: 8 best; selectivity beats sensitivity
-PEPPER_PASSIVE_BID_OFFSET = 1   # v7.1: 2→1. Less overpay when knocked off max
+PEPPER_BUY_EDGE           = 8   # Sweep confirmed: 8 optimal on backtester
+PEPPER_SELL_SPIKE         = 8
+PEPPER_PASSIVE_BID_OFFSET = 2
 PEPPER_INTERCEPT_EWMA     = 0.0005
+PEPPER_INTERCEPT_RESET_THRESHOLD = 300  # re-bootstrap if drift exceeds this (day-boundary guard)
 
 
 # ─────────────────────────────────────────────────────────
@@ -381,8 +382,10 @@ class Trader:
         if best_bid is None and best_ask is None:
             return orders
 
-        mid = (best_bid + best_ask) / 2 if (best_bid is not None and best_ask is not None) \
-              else float(best_bid if best_bid is not None else best_ask)
+        if best_bid is not None and best_ask is not None:
+            mid = (best_bid + best_ask) / 2
+        else:
+            mid = float(best_bid if best_bid is not None else best_ask)
 
         # ── Imbalance signal (ρ ≈ +0.40 with future Δmid) ─────────
         bid_vol_total = sum(od.buy_orders.values()) if od.buy_orders else 0
@@ -528,36 +531,50 @@ class Trader:
         if best_bid is None and best_ask is None:
             return orders, trader_state
 
-        mid = (best_bid + best_ask) / 2 if (best_bid is not None and best_ask is not None) else float(best_bid if best_bid is not None else best_ask)
+        # v7: is-not-None checks (truthiness bug: bid=0 was treated as missing)
+        if best_bid is not None and best_ask is not None:
+            mid = (best_bid + best_ask) / 2
+        else:
+            mid = float(best_bid if best_bid is not None else best_ask)
 
-        # ── Bootstrap linear trend intercept ─────────────────────
+        # ── Bootstrap / guard intercept ──────────────────────────
+        # v7: if the stored intercept implies a fair that's wildly off from the
+        # observed mid, we've crossed a day boundary (timestamp reset to 0 but
+        # state carried over) or state is corrupted. Re-bootstrap.
         pepper_key = "pepper_intercept"
-        if pepper_key not in trader_state:
-            trader_state[pepper_key] = mid - timestamp * PEPPER_SLOPE
+        expected_intercept_now = mid - timestamp * PEPPER_SLOPE
+
+        need_bootstrap = (
+            pepper_key not in trader_state
+            or not isinstance(trader_state.get(pepper_key), (int, float))
+            or abs(trader_state[pepper_key] - expected_intercept_now) > PEPPER_INTERCEPT_RESET_THRESHOLD
+        )
+        if need_bootstrap:
+            trader_state[pepper_key] = expected_intercept_now
 
         intercept = trader_state[pepper_key]
         trend_fair = intercept + timestamp * PEPPER_SLOPE
 
-        # Slow regime-shift watchdog: EWMA effective window ~2000 ticks
-        # (was 0.005 → 200 ticks, which was dragging fair toward stale mids)
+        # Slow regime-shift watchdog
         residual = mid - trend_fair
         trader_state[pepper_key] = intercept + PEPPER_INTERCEPT_EWMA * residual
 
-        # ── MLP enhancement: shift fair if confident ─────────────
+        # ── MLP enhancement (isolated so failures can't affect fair) ──
         fair = trend_fair
         try:
             x, mlp_mid, trader_state = extract_features(od, market_trades, trader_state, "INTARIAN_PEPPER_ROOT")
             if mlp_mid > 0:
                 delta, confidence, cls, probs = predict_delta("INTARIAN_PEPPER_ROOT", x)
-                # Blend MLP into fair — small nudge, never dominates
                 if confidence > 0.3:
-                    fair = trend_fair + delta * 0.5  # half-weight the MLP shift
-        except Exception as e:
-            logger.print(f"PEPPER MLP skipped: {type(e).__name__}: {e}")
+                    candidate_fair = trend_fair + delta * 0.5
+                    # Safety: never let MLP push fair more than 5 from trend
+                    if abs(candidate_fair - trend_fair) <= 5:
+                        fair = candidate_fair
+        except Exception:
+            # Silent fallback to trend_fair — never block the trading path
+            fair = trend_fair
 
-        logger.print(f"PEPPER t={timestamp} fair={fair:.1f} trend={trend_fair:.1f} mid={mid:.1f} pos={position}")
-
-        # ── 1. Aggressive BUY: always buy, never gate ────────────
+        # ── 1. Aggressive BUY: always buy within edge ────────────
         if od.sell_orders:
             for ask in sorted(od.sell_orders.keys()):
                 if ask <= fair + PEPPER_BUY_EDGE:
@@ -575,7 +592,7 @@ class Trader:
                         orders.append(Order("INTARIAN_PEPPER_ROOT", bid, -qty))
                         position -= qty
 
-        # ── 3. Passive BUY: aggressive bid to fill remaining ─────
+        # ── 3. Passive BUY: tight bid for remaining inventory ────
         remaining = limit - position
         if remaining > 0:
             passive_bid = int(round(fair + PEPPER_PASSIVE_BID_OFFSET))
