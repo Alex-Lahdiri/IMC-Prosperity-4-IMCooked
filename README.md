@@ -1,106 +1,59 @@
-# IMC Prosperity 4 Backtester
+# IMC Prosperity 4: team IMCooked
 
-This repository contains a Python-based backtester designed in preparation for the [IMC Prosperity 4 challenge](https://prosperity.imc.com/). 
+Our algorithms for the first two rounds of [IMC Prosperity 4](https://prosperity.imc.com/), IMC's algorithmic trading competition, April 2026. Team of four.
 
-**Key Notes:**
-* **Origin:** This project is heavily based on [jmerle/imc-prosperity-3-backtester](https://github.com/jmerle/imc-prosperity-3-backtester), but it has been rewritten to utilize a more Object-Oriented Programming (OOP) style. 
-* **Current Status:** The codebase is up to date with the Prosperity 4 tutorial round.
-* **License:** MIT License.
+**Result:** 1st worldwide in Round 1 manual trading, and top 15% of 18,803 teams overall.
 
----
+Everything here is simulated. Prosperity is a simulated exchange with an in-game currency, and every profit figure below is a backtest in that currency.
 
-**Usage:**
+The short case study, including the later rounds, is at [alexlahdiri.com/#imc](https://alexlahdiri.com/#imc).
 
-**Basic usage:**
+## What is in this repository
 
-Run the backtester on an algorithm using all data from round 0
+Rounds 1 and 2 traded two products with a position limit of 80 each. The option and Monte Carlo work from the later rounds is not uploaded here.
+
+| Product | What it does | How we traded it |
+|---|---|---|
+| `ASH_COATED_OSMIUM` | Mean-reverts around a fixed value of 10,000 | Market making around 10,000, with quotes skewed by inventory |
+| `INTARIAN_PEPPER_ROOT` | Drifts up by 1 for every 1,000 timestamps | Buy and hold the drift, with a regime check as a safety net |
+
+| File | What it is |
+|---|---|
+| `trader.py` | Round 1. Osmium market maker quoting 10,000 ± 5; Pepper Root priced off its fitted trend line |
+| `trader4.py` | Round 1 iteration with tighter Osmium quotes and a maximum-long Pepper Root position; the comments mark which ideas came from a teammate |
+| `trademlpalgo.py`, `advalgo.py`, `trader+MLP` | Iterations that add a teammate's neural network price model (18 order-book features in; `MLP_WB` holds a set of its weights) |
+| `trader_r2_final.py` | **Round 2 final.** The version to read first: its parameters are explained in comments beside them |
+| `MohilTradingAlgo/` | A teammate's Round 1 submission with the platform's result log |
+| `prosperity4bt/` | The backtester we used, by kevin-fu1 (MIT licence, see [`LICENSE`](LICENSE)), which builds on [jmerle's Prosperity 3 backtester](https://github.com/jmerle/imc-prosperity-3-backtester). Its own guide is [`BACKTESTER.md`](BACKTESTER.md) |
+
+I wrote the trader files. Teammates contributed the neural network and the ideas credited in the code comments.
+
+## The Round 2 algorithm
+
+**Osmium.** Passive market making at a fair value of 10,000. Quotes sit 5 either side, inside the roughly 16-wide spread the exchange's own bots leave. 80% of the size goes on that quote and 20% two ticks behind it. Quotes shift against the current position, more than proportionally as it grows, and the position is flattened before the session ends.
+
+**Pepper Root.** The price rises by 1 per 1,000 timestamps on all three days of sample data, with residuals of about 2.5. The algorithm buys to the position limit and holds. Exponential averages of the residual and of momentum classify the market as bullish, hold or bearish; both have to turn before it unwinds, at no more than 10 units per tick.
+
+**Market access fee.** Round 2 sold extra order flow by sealed bid: the top half of bids won 25% more flow and paid what they bid. We bid 8,000 against an estimated value of 20,000 to 25,000.
+
+## Two decisions you can see in the code
+
+**Paying one tick more to get filled.** An earlier version bought Pepper Root up to 8 above fair value. The exchange's asks moved from 6.5 to 7.5 above mid across the three sample days, so that rule filled 97.5%, then 81.9%, then 71.6% of the time. Raising the limit to 9 filled 99.3%, 97.3% and 94.9%. One extra tick per purchase is small against a price that rises about 1,000 a day.
+
+**Not trusting the neural network.** We suspected the price model had been trained with data leakage. It stayed in the final algorithm on a short lead: it can move the fair value by at most 3, only in a bullish regime, and only when its confidence is above 0.4.
+
+## Run it
+
 ```bash
- $ python -m prosperity4bt <path to algorithm file> 0
- ```
+pip install -r requirements.txt
 
-Run the backtester on an algorithm using all data from round 0, day '-2'
-```bash
- $ python -m prosperity4bt <path to algorithm file> 0--2
- ```
+# macOS or Linux
+PYTHONPATH=prosperity4bt python -m prosperity4bt trader_r2_final.py 1 --no-vis
 
-If you see: `No module named 'datamodel'`, set PYTHONPATH to the folder containing datamodel.py:  
-```bash
- $env:PYTHONPATH="<path to>\imc-prosperity-4-backtester\prosperity4bt"
+# Windows PowerShell
+$env:PYTHONPATH="prosperity4bt"; python -m prosperity4bt trader_r2_final.py 1 --no-vis
 ```
 
-**Run/Debug from Pycham**
+On the three days of Round 1 data in this repository, that prints a profit of 259,762 for `trader_r2_final.py` and 51,337 for `trader.py`.
 
-Add Run/Debug Configuration:
-
-![Pycham Config](images/pycharm.png)
----
-## Overall Structure & How It Works
-
-The architecture of the program is modularized to cleanly separate data loading, simulation execution, and order matching. Below is the structural diagram of the backtester:
-
-![Backtester Architecture](images/backtester.png)
-
-### Component Breakdown & Execution Flow
-
-Based on the architecture diagram, the system operates through the following primary components and execution steps:
-
-#### 1. The `BackTester` (Main Controller)
-This is the top-level driver of the simulation:
-* **Initialization:** It begins by executing the `Load Algorithm Module` step to ingest your trading logic.
-* **Iteration:** It initializes an empty `results = []` list and iterates through a nested loop: `for each round` and `for each day`. For every day, it executes the `Run Test` function, which calls the `TestRunner`. It then appends the output to the `results` list.
-* **Completion:** Once all rounds and days are processed, it calls `Merge Results` to combine the data and triggers `Write Output File` to produce a consolidated log (e.g., `2026-03-01_08-35-51.log` containing trading results).
-
-#### 2. The `TestRunner` (Daily Simulator)
-The `TestRunner` is responsible for simulating the market environment for a single day:
-* **Read Data:** It triggers `Read Data` which calls the `BackDataReader` to read the market data from 2 csv files (price and trade). The reader parses the files (e.g.`prices_round_1_day_0.csv` and `trades_round_1_day_0.csv`) and returns a `BacktestData` object. This step yields `Result - Stage 0`.
-* **Timestamp Loop:** For each timestamp in the loaded data (`for each timestamp`), the runner executes a sequence of events:
-    1. **Initialize TradeState:** Prepares the current state of the market.
-    2. **Trade:** Creates a `TradingState` object and passes it into the user's `Algorithm`. 
-    3. **Algorithm Execution:** The user's `Algorithm` processes the state and returns proposed orders and a string as `TraderData`. Any standard output (`stdout`) generated by the algorithm is captured as `lambda_log`. This execution step yields `Result - Stage 1`.
-    4. **Create Activity Logs:** The `ActivityLogCreator` steps in to record the actions, orders, and market state of the current timestamp. This yields `Result - Stage 2`.
-    5. **Match Orders:** The proposed orders are passed to the `OrderMatchMaker`, which simulates the exchange mechanics to fill orders against the historical order book. This yields `Result - Stage 3`.
-* **Results Aggregation:** After the timestamp loop concludes, the overall day's simulation yields `Result - Stage 4`, which is returned back to the `BackTester`.
-
-#### 3. Core Helper Modules
-* **`BackDataReader`:** Handles the file ingestion of CSV price and trade data into programmatic objects.
-* **`ActivityLogCreator`:** Responsible for standardizing and formatting the activity logs for later analysis and debugging.
-* **`OrderMatchMaker`:** The internal simulation engine that determines which algorithm orders execute and updating positions.
-## Explanation of Data Models
-
-The backtester relies on a specific set of data models to process market information and log simulation results cleanly. 
-
-* **`datamodel.py`**: This file contains the core data models that are shared between the `BackTester` and your custom `Algorithm`. **(Please do not change this file)**. Modifying it may break compatibility with the official Prosperity environment.
-* **`models/` directory**: The models located within the `models` folder are specifically defined for the internal operations of the `BackTester`.
-* **Input Data Models (`models/input.py`)**: This file defines the models that capture the raw market data from the input files. During the setup phase, data is extracted from the price data files and trade data files:
-
-  **Price Data:**
-  
-  ![Price Data](images/price_data.png)
-
-  **Trade Data:**
-  
-  ![Trade Data](images/trade_data.png)
-
-  This raw data is then structured and filled into the `BacktestData` model, which acts as the data source for the simulation:
-
-  **Backtest Data:**
-  
-  ![Backtest Data](images/back_test_data.png)
-
-* **Result Data Models (`models/output.py`)**: Models defined here are responsible for capturing the test result data generated during the simulation. 
-  
-  Once the backtest is complete, the system compiles the findings into a `BacktestResult` object:
-
-  **Backtest Result:**
-  
-  ![Backtest Result](images/result_final_stage.png)
-
-  Finally, this structured result data is written directly into the standard output log file so you can review your algorithm's performance and activities:
-
-  **Output Log File:**
-  
-  ![Output Log File](images/out_put_log_file.png)
-
-    **lambda_log**
-   It contains the standard output generated by the algorithm. If you use the Logger class specified in my [Visualizer](https://github.com/kevin-fu1/imc-prosperity-4-visualizer), the data captured will be something like this:
-  ![Output Log File](images/lambda_log_data.png)
+Read those as a comparison between versions, not as results. The backtester fills orders against a recorded order book with no other teams competing for the same trades, so it overstates what a live round pays.

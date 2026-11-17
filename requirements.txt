@@ -1,0 +1,6 @@
+# Needed by the backtester in prosperity4bt/
+typer
+tqdm
+orjson
+jsonpickle
+ipython
